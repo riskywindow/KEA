@@ -1,0 +1,3 @@
+# Calibration / evaluation data is fetched, never committed.
+*
+!.gitignore

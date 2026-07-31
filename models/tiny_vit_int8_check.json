@@ -1,0 +1,13 @@
+{
+  "model": "tiny_vit",
+  "trained": false,
+  "note": "Random-init weights. Classification accuracy is meaningless and is deliberately not reported; this measures int8-vs-float numerical agreement only.",
+  "observer": "percentile",
+  "calib_images": 32,
+  "inputs": 16,
+  "logit_cosine_similarity_mean": 0.9982692408547598,
+  "logit_cosine_similarity_min": 0.9940654681008475,
+  "argmax_match": 15,
+  "int8_argmax_in_float_top5": 16,
+  "max_abs_logit_error_mean": 0.15216055572540532
+}

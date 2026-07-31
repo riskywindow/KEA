@@ -65,39 +65,53 @@ def batches(items, bs, size=224):
         yield kdata.load_batch(items[i : i + bs], size)
 
 
+def _topk(logits: np.ndarray, k: int = 5) -> np.ndarray:
+    """Indices of the top ``k`` logits per row, unordered."""
+    return np.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+
+
 def eval_float(model, items, bs):
-    """Top-1 of the *original torchvision model* -- the honest float baseline."""
+    """Top-1/top-5 of the *original torchvision model* -- the float baseline."""
     import torch
 
-    correct = total = 0
+    c1 = c5 = total = 0
     preds = []
     with torch.no_grad():
         for x, y in batches(items, bs):
             xt = torch.as_tensor(x).permute(0, 3, 1, 2).contiguous()
-            p = model(xt).argmax(dim=1).numpy()
+            lg = model(xt).numpy()
+            p = lg.argmax(axis=1)
             preds.append(p)
-            correct += int((p == y).sum())
+            c1 += int((p == y).sum())
+            c5 += int((_topk(lg) == y[:, None]).any(axis=1).sum())
             total += len(y)
-    return correct, total, np.concatenate(preds) if preds else np.array([])
+    return c1, c5, total, np.concatenate(preds) if preds else np.array([])
 
 
 def eval_int8(g: KGraph, items, bs, log_every=10):
-    correct = total = 0
+    """Top-1/top-5 from the bit-exact integer reference interpreter.
+
+    Argmax is taken on the raw int32/int8 logits: requantization is monotonic,
+    so ranking them is identical to ranking their dequantized values, and this
+    keeps the evaluation path free of float entirely.
+    """
+    c1 = c5 = total = 0
     preds = []
     t0 = time.time()
     tin = g.tensor("input")
     for bi, (x, y) in enumerate(batches(items, bs)):
         xq = quantize(x, tin)
-        out = execute(g, {"input": xq})[g.outputs[0]]
-        p = np.asarray(out).argmax(axis=-1)
+        out = np.asarray(execute(g, {"input": xq})[g.outputs[0]])
+        p = out.argmax(axis=-1)
         preds.append(p)
-        correct += int((p == y).sum())
+        c1 += int((p == y).sum())
+        c5 += int((_topk(out.astype(np.int32)) == y[:, None]).any(axis=1).sum())
         total += len(y)
         if log_every and bi % log_every == 0:
             el = time.time() - t0
             print(f"    int8 eval {total}/{len(items)}  "
                   f"({el:.0f}s, {el/max(total,1):.2f}s/img)", flush=True)
-    return correct, total, np.concatenate(preds) if preds else np.array([])
+    return c1, c5, total, np.concatenate(preds) if preds else np.array([])
 
 
 def main() -> int:
@@ -145,20 +159,27 @@ def main() -> int:
     float_line = None
     if eval_items:
         print(f"\n  float baseline on {len(eval_items)} imagenette2-160/val images...")
-        c, t, fpred = eval_float(model, eval_items, args.batch)
-        float_line = (c, t)
-        print(f"  float top-1: {c}/{t} = {100.0*c/t:.2f}%")
+        c1, c5, t, fpred = eval_float(model, eval_items, args.batch)
+        float_line = (c1, c5, t)
+        print(f"  float top-1: {c1}/{t} = {100.0*c1/t:.2f}%   "
+              f"top-5: {c5}/{t} = {100.0*c5/t:.2f}%")
     else:
         fpred = None
 
     report = {
         "model": "mobilenetv2",
         "weights": "torchvision IMAGENET1K_V1",
-        "eval_set": "imagenette2-160/val (10-class ImageNet subset)",
+        "eval_set": "imagenette2-160/val (10-class ImageNet-1k subset)",
+        "eval_note":
+            "The classifier is 1000-way; only the 10 Imagenette classes appear as "
+            "labels. Top-1 is depressed by genuine ImageNet class ambiguity "
+            "(e.g. 'church' vs monastery/dome/mosque), which is why top-5 is also "
+            "reported. This is NOT ImageNet-1k top-1.",
         "eval_images": len(eval_items) if eval_items else 0,
         "calib_images": 0 if synthetic else len(calib_items),
         "calib_source": "synthetic gaussian" if synthetic else "imagenette2-160/train",
-        "float_top1": None if not float_line else float_line[0] / float_line[1],
+        "float_top1": None if not float_line else float_line[0] / float_line[2],
+        "float_top5": None if not float_line else float_line[1] / float_line[2],
         "observers": {},
     }
 
@@ -187,13 +208,15 @@ def main() -> int:
         if eval_items:
             geval = build_graph(build_fn, [args.eval_batch, 224, 224, 3], calib,
                                 f"mobilenetv2_int8_{obs}_eval")
-            c, t, ipred = eval_int8(geval, eval_items, args.eval_batch)
+            c1, c5, t, ipred = eval_int8(geval, eval_items, args.eval_batch)
             entry.update(
-                int8_top1=c / t, int8_correct=c, int8_total=t,
-                agreement_with_float=float((ipred == fpred).mean()),
+                int8_top1=c1 / t, int8_top5=c5 / t,
+                int8_top1_correct=c1, int8_top5_correct=c5, int8_total=t,
+                top1_agreement_with_float=float((ipred == fpred).mean()),
             )
-            print(f"  int8 top-1 ({obs}): {c}/{t} = {100.0*c/t:.2f}%   "
-                  f"top-1 agreement with float: {100.0*(ipred==fpred).mean():.2f}%")
+            print(f"  int8 top-1 ({obs}): {c1}/{t} = {100.0*c1/t:.2f}%   "
+                  f"top-5: {c5}/{t} = {100.0*c5/t:.2f}%   "
+                  f"argmax agreement with float: {100.0*(ipred==fpred).mean():.2f}%")
         report["observers"][obs] = entry
 
         if obs == args.observer:

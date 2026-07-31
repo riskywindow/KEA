@@ -211,12 +211,13 @@ def build_tiny_vit(net, x, cfg: TinyViTConfig, p: Dict[str, np.ndarray]):
     * the attention ``1/sqrt(head_dim)`` is folded into the QK^T rescale, so it
       costs no runtime work
     """
-    g = cfg.image_size // cfg.patch
     t, d, nh, hd = cfg.tokens, cfg.dim, cfg.heads, cfg.head_dim
+    n = int(x.shape[0])
+    bh = n * nh
 
     h = net.conv2d("patch", x, p["patch.w"], p["patch.b"],
                    (cfg.patch, cfg.patch), (0, 0, 0, 0), (1, 1), 1, None)
-    h = net.reshape("patch_tok", h, [1, t, d])
+    h = net.reshape("patch_tok", h, [n, t, d])
 
     h = net.add("pos_add", h, net.constant("pos", p["pos"]))
 
@@ -228,14 +229,23 @@ def build_tiny_vit(net, x, cfg: TinyViTConfig, p: Dict[str, np.ndarray]):
         k = net.linear(f"{s}.k", n1, p[f"{s}.k.w"], p[f"{s}.k.b"])
         v = net.linear(f"{s}.v", n1, p[f"{s}.v.w"], p[f"{s}.v.b"])
 
-        q = net.transpose(f"{s}.qh", net.reshape(f"{s}.qr", q, [t, nh, hd]), [1, 0, 2])
-        k = net.transpose(f"{s}.kh", net.reshape(f"{s}.kr", k, [t, nh, hd]), [1, 2, 0])
-        v = net.transpose(f"{s}.vh", net.reshape(f"{s}.vr", v, [t, nh, hd]), [1, 0, 2])
+        # [N,T,D] -> [N,T,H,Dh] -> [N,H,T,Dh] -> [N*H,T,Dh].  tosa.matmul is
+        # strictly rank 3, so batch and head must be folded into one axis.
+        def heads(nm, z, perm, shape3):
+            z = net.reshape(f"{nm}r", z, [n, t, nh, hd])
+            z = net.transpose(f"{nm}t", z, perm)
+            return net.reshape(f"{nm}h", z, shape3)
+
+        q = heads(f"{s}.q", q, [0, 2, 1, 3], [bh, t, hd])
+        k = heads(f"{s}.k", k, [0, 2, 3, 1], [bh, hd, t])
+        v = heads(f"{s}.v", v, [0, 2, 1, 3], [bh, t, hd])
 
         a = net.matmul(f"{s}.qk", q, k, extra_scale=inv_sqrt)
         a = net.softmax(f"{s}.sm", a, axis=-1)
         c = net.matmul(f"{s}.ctx", a, v)
-        c = net.reshape(f"{s}.cf", net.transpose(f"{s}.ct", c, [1, 0, 2]), [1, t, d])
+        c = net.reshape(f"{s}.c4", c, [n, nh, t, hd])
+        c = net.transpose(f"{s}.ct", c, [0, 2, 1, 3])
+        c = net.reshape(f"{s}.cf", c, [n, t, d])
         c = net.linear(f"{s}.proj", c, p[f"{s}.proj.w"], p[f"{s}.proj.b"])
         h = net.add(f"{s}.res1", h, c)
 
@@ -246,8 +256,9 @@ def build_tiny_vit(net, x, cfg: TinyViTConfig, p: Dict[str, np.ndarray]):
         h = net.add(f"{s}.res2", h, m)
 
     h = net.layernorm("ln_f", h, p["ln_f.g"], p["ln_f.b"])
-    h = net.reshape("tok_nhwc", h, [1, t, 1, d])
+    # mean over tokens, expressed as an NHWC global average pool
+    h = net.reshape("tok_nhwc", h, [n, t, 1, d])
     h = net.global_avg_pool("pool", h)
-    h = net.reshape("pool_flat", h, [1, d])
+    h = net.reshape("pool_flat", h, [n, d])
     h = net.linear("head", h, p["head.w"], p["head.b"])
     return h

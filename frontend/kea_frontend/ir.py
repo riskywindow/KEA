@@ -212,6 +212,36 @@ class Node:
         )
 
 
+def dumps_compact(doc: Any, indent: int = 1) -> str:
+    """``json.dumps`` with indentation, but flat numeric arrays kept on one line.
+
+    Per-channel scale and multiplier arrays are hundreds of entries long.  Plain
+    ``indent=1`` puts each number on its own line, which inflates MobileNetV2's
+    graph from ~350 KB to 2.5 MB and makes it unreadable.  Structure stays
+    indented; leaves stay compact.  Output is still ordinary JSON.
+    """
+
+    def enc(x: Any, depth: int) -> str:
+        pad = " " * (indent * depth)
+        pad_in = " " * (indent * (depth + 1))
+        if isinstance(x, dict):
+            if not x:
+                return "{}"
+            items = [f"{pad_in}{json.dumps(str(k))}: {enc(v, depth + 1)}" for k, v in x.items()]
+            return "{\n" + ",\n".join(items) + "\n" + pad + "}"
+        if isinstance(x, (list, tuple)):
+            if not x:
+                return "[]"
+            # a flat array of scalars stays on one line
+            if all(v is None or isinstance(v, (int, float, bool, str)) for v in x):
+                return json.dumps(list(x))
+            items = [f"{pad_in}{enc(v, depth + 1)}" for v in x]
+            return "[\n" + ",\n".join(items) + "\n" + pad + "]"
+        return json.dumps(x)
+
+    return enc(doc, 0)
+
+
 def _jsonify(x: Any) -> Any:
     """Convert numpy scalars/arrays inside attrs into plain JSON types."""
     if isinstance(x, dict):
@@ -343,7 +373,7 @@ class KGraph:
         os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
         doc = self.to_json(os.path.basename(npz_path))
         with open(json_path, "w") as f:
-            json.dump(doc, f, indent=1, sort_keys=False)
+            f.write(dumps_compact(doc))
             f.write("\n")
         np.savez(npz_path, **self.consts)
         return npz_path

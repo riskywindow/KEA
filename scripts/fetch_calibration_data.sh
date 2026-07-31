@@ -18,7 +18,8 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="$ROOT/models/data"
-URL="https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
+# Override to use a mirror, or to exercise the offline path in a test.
+URL="${KEA_CALIB_URL:-https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz}"
 TGZ="$DATA_DIR/imagenette2-160.tgz"
 EXTRACTED="$DATA_DIR/imagenette2-160"
 MARKER="$DATA_DIR/.imagenette-ok"

@@ -1,0 +1,47 @@
+{
+  "format": "kea.golden_io",
+  "version": 1,
+  "note": "Feed input_<i> to your implementation of the named graph and assert exact integer equality with output_<i>. No tolerance.",
+  "models": {
+    "mobilenetv2_int8": {
+      "graph": "models/mobilenetv2_int8.kgraph.json",
+      "cases": 4,
+      "input_tensor": "input",
+      "input_dtype": "int8",
+      "input_shape": [
+        1,
+        224,
+        224,
+        3
+      ],
+      "output_tensor": "fc",
+      "output_dtype": "int8",
+      "output_shape": [
+        1,
+        1000
+      ],
+      "input_source": "imagenette2-160/val",
+      "sha256_of_concatenated_outputs": "5f6473718508e1e89dae94cc65d9f115bbd636537a77bcff693efe62ed72ee1b"
+    },
+    "tiny_vit_int8": {
+      "graph": "models/tiny_vit_int8.kgraph.json",
+      "cases": 4,
+      "input_tensor": "input",
+      "input_dtype": "int8",
+      "input_shape": [
+        1,
+        224,
+        224,
+        3
+      ],
+      "output_tensor": "head",
+      "output_dtype": "int8",
+      "output_shape": [
+        1,
+        1000
+      ],
+      "input_source": "imagenette2-160/val",
+      "sha256_of_concatenated_outputs": "ca1fd26a1074352c90e5a988ad355209a4afddb73b32eb72722ee7e5c8662e08"
+    }
+  }
+}

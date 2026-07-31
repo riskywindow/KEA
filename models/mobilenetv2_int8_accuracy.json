@@ -1,0 +1,32 @@
+{
+  "model": "mobilenetv2",
+  "weights": "torchvision IMAGENET1K_V1",
+  "eval_set": "imagenette2-160/val (10-class ImageNet-1k subset)",
+  "eval_note": "The classifier is 1000-way; only the 10 Imagenette classes appear as labels. Top-1 is depressed by genuine ImageNet class ambiguity (e.g. 'church' vs monastery/dome/mosque), which is why top-5 is also reported. This is NOT ImageNet-1k top-1.",
+  "eval_images": 1000,
+  "calib_images": 384,
+  "calib_source": "imagenette2-160/train",
+  "float_top1": 0.67,
+  "float_top5": 0.908,
+  "observers": {
+    "minmax": {
+      "observer": "minmax",
+      "int8_top1": 0.67,
+      "int8_top5": 0.904,
+      "int8_top1_correct": 670,
+      "int8_top5_correct": 904,
+      "int8_total": 1000,
+      "top1_agreement_with_float": 0.878
+    },
+    "percentile": {
+      "observer": "percentile",
+      "percentile": 99.99,
+      "int8_top1": 0.679,
+      "int8_top5": 0.895,
+      "int8_top1_correct": 679,
+      "int8_top5_correct": 895,
+      "int8_total": 1000,
+      "top1_agreement_with_float": 0.913
+    }
+  }
+}

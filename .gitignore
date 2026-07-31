@@ -12,3 +12,8 @@ models/*.pt
 models/*.onnx
 .DS_Store
 compile_commands.json
+
+# Generated model artifacts -- regenerate with frontend/export_mobilenetv2.py
+# and frontend/export_tiny_vit.py. Too large and too reproducible to track.
+models/*.npz
+models/*.kgraph.json

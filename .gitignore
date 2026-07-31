@@ -1,0 +1,14 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+*.o
+*.a
+*.dylib
+out/
+artifacts/
+*.keaf
+models/*.pt
+models/*.onnx
+.DS_Store
+compile_commands.json

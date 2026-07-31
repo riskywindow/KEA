@@ -64,3 +64,28 @@ python3 -m venv .venv
 
 Always invoke as `.venv/bin/python`, never a bare `python3` — the system
 interpreter has an arch-mismatched torch installed against it.
+
+### TLS certificates
+
+The framework Python ships without a usable CA bundle, so `torchvision` weight
+downloads fail with `CERTIFICATE_VERIFY_FAILED`. Point OpenSSL at `certifi`:
+
+```sh
+export SSL_CERT_FILE=$(.venv/bin/python -c 'import certifi;print(certifi.where())')
+```
+
+`scripts/env.sh` does this for you.
+
+## `scripts/env.sh`
+
+Source it to get everything above at once — venv path, `mlir-opt` and the built
+`kea-*` tools on `PATH`, `MLIR_DIR`/`LLVM_DIR` for CMake, and the CA bundle:
+
+```sh
+source scripts/env.sh
+```
+
+## Cached assets
+
+`~/.cache/torch/hub/checkpoints/mobilenet_v2-b0353104.pth` — pretrained
+MobileNetV2 (3,504,872 params), the end-to-end demo network.

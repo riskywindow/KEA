@@ -31,14 +31,6 @@ classifications for reasons that look like a kernel bug and are not.
 **The compiler must only ever emit normalised quantization parameters, and on
 that domain the two algorithms are provably identical.**
 
-The invariant, in the two algorithms' own units:
-
-| Parameter | Constraint |
-| --- | --- |
-| `mult` | `[2^30, 2^31)` — normalised Q31, top bit set |
-| TOSA `shift` | `>= 31` |
-| `KeaQuantParam.shift` | `>= 0` |
-
 The shift conventions differ by exactly 31, because `keaSrdhm` already performs
 a `>>31` that TOSA's formulation carries explicitly:
 
@@ -46,29 +38,52 @@ a `>>31` that TOSA's formulation carries explicitly:
 kea_shift = tosa_shift - 31
 ```
 
-Measured over 400,000 random cases on the normalised domain: **0 divergences.**
-Measured with an un-normalised multiplier (`mult < 2^30`) but `shift >= 31`:
-**0 divergences** — normalising the multiplier is good hygiene but is not what
-carries the equivalence. Measured with `tosa_shift < 31`, i.e. a *negative*
-`KeaQuantParam.shift`: **~48% divergence.**
+**The invariant:**
 
-So the load-bearing half of the invariant is `KeaQuantParam.shift >= 0`. The
-negative-shift path in `keaRequantize` — the pre-multiply left shift — has no
-TOSA counterpart and is where the two designs part company.
+> For every requantization the compiler emits, either `tosa_shift >= 31`, or the
+> accumulator satisfies `|acc + bias| < 2^tosa_shift`.
+
+Measured evidence:
+
+| domain | divergences |
+| --- | --- |
+| normalised: `mult ∈ [2^30,2^31)`, `tosa_shift ∈ [31,62]` | **0 / 400,000** |
+| un-normalised `mult < 2^30`, `tosa_shift >= 31` | **0 / 200,000** |
+| `tosa_shift = 22` (`kea_shift = -9`), `|v| < 2^20` | **0 / 200,000** |
+| `tosa_shift = 22` (`kea_shift = -9`), `|v| < 2^24` | 79,048 / 200,000 (39.5%) |
+| `tosa_shift ∈ {25,28,30}`, `|v| < 2^24` | **0 / 200,000** each |
+
+Normalising the multiplier is hygiene; it is not what carries the equivalence.
+
+### Why `shift < 31` is usually fine
+
+A negative `KeaQuantParam.shift` selects `keaRequantize`'s pre-multiply left
+shift, `v << (31 - tosa_shift)`, which has no TOSA counterpart. But it is
+*numerically exact* until that shift overflows int32 — which is precisely when
+`|v| >= 2^tosa_shift`. That is why `tosa_shift = 22` is exact at `|v| < 2^20`
+and 39.5% wrong at `|v| < 2^24`, while `tosa_shift = 25` is exact at both.
+
+This matters because real models need it. MobileNetV2's rescale shifts, as
+emitted by our frontend, range over **22 to 48** — a blanket `tosa_shift >= 31`
+rule would reject the network we are built to run. A rescale with
+`tosa_shift < 31` is one whose scale factor exceeds 1, which is entirely normal
+where an operand's scale is much finer than its consumer's.
 
 ## Consequences
 
-- `kea-as` rejects a `KeaQuantParam` with `shift < 0`, and the compiler backend
-  must normalise before emitting. A quantization scale that would require a
-  negative shift means the output scale is larger than the accumulator scale,
-  which for a real quantized network means something upstream is wrong; failing
-  loudly beats silently producing a stream the golden model can't reproduce.
-- `tests/invariants/test_requant_equivalence.cpp` re-proves the equivalence on
-  every build, and asserts divergence outside the domain so the test cannot
-  quietly become vacuous.
-- `keaRequantize`'s negative-shift path stays in the ISA — it is legal hardware
-  behaviour, and a future non-TOSA frontend could use it. It is simply outside
-  the domain this compiler targets.
+- **The compiler backend must carry an accumulator range bound** for every
+  requantization it emits, and check it against the invariant. It already needs
+  such a bound for errata E5 (int32 ACC overflow), so this is one bound serving
+  two purposes. When `tosa_shift < 31` and the bound cannot establish
+  `|acc| < 2^tosa_shift`, the backend must fail loudly rather than emit a stream
+  the golden model cannot reproduce.
+- `tests/invariants/test_requant_equivalence.cpp` re-proves this on every build,
+  including the exactness of the negative-shift path within its range and its
+  failure outside — so the test cannot quietly become vacuous if someone makes
+  the two algorithms trivially equal.
+- A conservative fallback exists if a layer ever violates the bound: split the
+  rescale into a `tosa_shift >= 31` requantization followed by an explicit
+  scale-up, at the cost of an extra VPU pass. Not currently needed.
 
 ## Why not just make them the same function?
 

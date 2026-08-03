@@ -48,8 +48,8 @@ std::int32_t tosaVquant(std::int32_t v, std::int32_t mult, std::int32_t tosa_shi
 /// Sweep a parameter box and count divergences between the two algorithms.
 /// `tosa_shift` is the TOSA convention; the KEA convention is 31 less, because
 /// keaSrdhm already performs the >>31 that TOSA carries explicitly (ADR-0003).
-long sweep(std::uint64_t seed, std::int64_t mult_lo, std::int64_t mult_hi,
-           int shift_lo, int shift_hi, int n) {
+long sweepBounded(std::uint64_t seed, std::int64_t mult_lo, std::int64_t mult_hi,
+                  int shift_lo, int shift_hi, std::int64_t value_bound, int n) {
   std::mt19937_64 rng(seed);
   long divergences = 0;
   for (int i = 0; i < n; ++i) {
@@ -58,7 +58,8 @@ long sweep(std::uint64_t seed, std::int64_t mult_lo, std::int64_t mult_hi,
     auto tosa_shift = static_cast<std::int32_t>(
         shift_lo + static_cast<int>(rng() % static_cast<std::uint32_t>(shift_hi - shift_lo + 1)));
     auto v = static_cast<std::int32_t>(
-        static_cast<std::int64_t>(rng() % 2000000001ull) - 1000000000);
+        static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(2 * value_bound)) -
+        value_bound);
 
     const std::int32_t from_hw =
         kea::keaRequantize(v, mult, tosa_shift - 31, 0, -128, 127);
@@ -66,6 +67,12 @@ long sweep(std::uint64_t seed, std::int64_t mult_lo, std::int64_t mult_hi,
     if (from_hw != from_ref) ++divergences;
   }
   return divergences;
+}
+
+/// Full int32-ish value range, the default for the in-domain sweeps.
+long sweep(std::uint64_t seed, std::int64_t mult_lo, std::int64_t mult_hi,
+           int shift_lo, int shift_hi, int n) {
+  return sweepBounded(seed, mult_lo, mult_hi, shift_lo, shift_hi, 1000000000, n);
 }
 
 }  // namespace
@@ -87,16 +94,26 @@ int main() {
               "%ld / 200000 divergences\n", d);
   check(d == 0, "equivalence should survive an un-normalised multiplier when shift >= 31");
 
-  // 3. Negative KeaQuantParam.shift is outside the domain and MUST diverge.
-  //    Without this the test could silently become vacuous -- if someone made
-  //    the two algorithms trivially equal, cases 1 and 2 would still pass.
-  d = sweep(0xD00D, kNormLo, kNormHi, 0, 30, 200000);
-  std::printf("tosa_shift < 31 (negative KeaQuantParam.shift, out of domain): "
+  // 3. tosa_shift < 31 selects keaRequantize's pre-multiply LEFT shift, which
+  //    has no TOSA counterpart. It is nonetheless numerically exact until that
+  //    shift overflows int32, i.e. while |v| < 2^tosa_shift. Real models need
+  //    this: MobileNetV2's rescale shifts run from 22 to 48.
+  d = sweepBounded(0xD00D, kNormLo, kNormHi, 22, 30, 1 << 20, 200000);
+  std::printf("tosa_shift 22..30, |v| < 2^20 (within range):                 "
               "%ld / 200000 divergences\n", d);
-  check(d > 20000, "the two algorithms must genuinely differ outside the domain, "
-                   "otherwise this test proves nothing");
+  check(d == 0, "the negative-shift path must be exact while the left shift fits");
 
-  // 4. The tie-breaking rules of the two primitives genuinely differ, which is
+  // 4. And it MUST break once the left shift overflows -- both because that is
+  //    the real hazard the backend has to bound, and because without a case
+  //    that diverges this test could silently become vacuous if someone made
+  //    the two algorithms trivially equal.
+  d = sweepBounded(0xD00D, kNormLo, kNormHi, 22, 22, 1 << 24, 200000);
+  std::printf("tosa_shift 22, |v| < 2^24 (overflows the left shift):         "
+              "%ld / 200000 divergences\n", d);
+  check(d > 20000, "the two algorithms must genuinely differ once the left shift "
+                   "overflows, otherwise this test proves nothing");
+
+  // 5. The tie-breaking rules of the two primitives genuinely differ, which is
   //    why the domain constraint is doing real work. Compare at -1.5:
   //      - TOSA's single shift rounds half-up toward +inf   -> -1
   //      - gemmlowp's RoundingDivideByPOT rounds half away from zero -> -2

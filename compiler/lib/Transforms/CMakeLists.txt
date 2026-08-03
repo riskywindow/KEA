@@ -3,6 +3,7 @@ add_mlir_library(MLIRKeaTransforms
   Annotate.cpp
   CanonicalizeEvents.cpp
   Fuse.cpp
+  Schedule.cpp
   Tile.cpp
 
   ADDITIONAL_HEADER_DIRS

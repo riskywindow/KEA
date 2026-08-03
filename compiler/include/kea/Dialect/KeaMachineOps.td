@@ -162,6 +162,23 @@ def Kea_AllocOp : Kea_Op<"alloc", [MemoryEffects<[MemAlloc]>]> {
       *advisory* because the authoritative range is the SSA def-use range;
       `mlir::kea::refreshLiveRanges()` recomputes it and any pass that moves ops
       must call it.
+    * `addr` is the **base address** `-kea-alloc` assigns, in the same elements
+      as every other offset in the buffer's space: bytes for SPM_A / SPM_W /
+      DRAM, int32 **words** for ACC. It is absent out of `-kea-tile` and
+      present after `-kea-alloc`; `-kea-emit` computes every instruction field
+      as `instr.X_addr = addr(X) + X_addr` (docs/MEMORY_PLANNING.md §1.1).
+
+      The verifier enforces what can be checked from the op alone: `addr >= 0`,
+      `addr % alignment == 0` -- which is what makes an aligned *displacement*
+      imply an aligned absolute address (docs/DIALECT_L2.md §4.1.1) -- and
+      `addr + extent <= capacity`. `-kea-alloc` additionally strengthens
+      `alignment` from the ops that use the buffer and re-checks the absolute
+      addresses; this verifier is the floor, not the whole rule.
+
+      This attribute was a *discardable* `kea.addr` until it was promoted here.
+      The old spelling is now rejected outright rather than silently ignored,
+      because a base address that quietly does not reach `-kea-emit` produces a
+      program that addresses byte 0 of every scratchpad.
 
     ```mlir
     %w = kea.alloc from %cst : tensor<24x1x1x4xi8>
@@ -186,7 +203,9 @@ def Kea_AllocOp : Kea_Op<"alloc", [MemoryEffects<[MemAlloc]>]> {
     OptionalAttr<Kea_QuantAttr>:$residual_quant,
     OptionalAttr<Kea_QuantAttr>:$output_quant,
     OptionalAttr<Kea_I64>:$input_zp,
-    OptionalAttr<DenseI64ArrayAttr>:$add_param
+    OptionalAttr<DenseI64ArrayAttr>:$add_param,
+    // The base address -kea-alloc assigns. Absent until then.
+    OptionalAttr<Kea_I64>:$addr
   );
 
   let results = (outs Kea_BufferType:$result);

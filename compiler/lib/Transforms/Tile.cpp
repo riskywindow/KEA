@@ -1404,6 +1404,7 @@ LogicalResult Tiler::lower(Operation *op) {
     s.OH = 1;
     s.OW = in[0];
     s.OC = w[0];
+    s.inputZp = fc.getZeroPoints().getInput();
     return lowerContraction(op, s, fc.getInput(), fc.getWeights(), fc.getBias(),
                             readEpilogue(fc.getEpilogue(), fc.getResidual()),
                             fc.getOutput(), "mxu_tiles_16x16");
@@ -1422,6 +1423,10 @@ LogicalResult Tiler::lower(Operation *op) {
     s.OH = 1;
     s.OW = a[1];
     s.OC = w[2];
+    // `zero_points.input` is the `a` zero point (KeaOps.td, kea.matmul). The
+    // MXU computes a raw sum a*b, so this has to reach the qparam block's bias
+    // correction; leaving it 0 biases every output channel by a constant.
+    s.inputZp = mm.getZeroPoints().getInput();
     return lowerContraction(op, s, mm.getA(), mm.getB(), mm.getBias(),
                             readEpilogue(mm.getEpilogue(), mm.getResidual()),
                             mm.getOutput(), "mxu_tiles_16x16_kn");

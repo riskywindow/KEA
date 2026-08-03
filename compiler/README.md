@@ -96,7 +96,9 @@ compiler/
     Dialect/{KeaDialect,KeaAttrs,KeaTypes,KeaOps,KeaMachineOps}.cpp
     Conversion/{TosaToKea,LinalgToKea,WeightLayout}.cpp
     Transforms/{Annotate,CanonicalizeEvents,Fuse}.cpp
+    Target/Kasm/{EmitKasm,ConstBlob}.cpp   the backend (ADR-0001)
   tools/kea-opt/kea-opt.cpp          the driver
+  tools/kea-translate/               Level 2 -> .kasm + .bin + .map.json
   test/                              .mlir tests + run_tests.sh
 ```
 
@@ -122,6 +124,7 @@ path.
 | pass (L1 in) | `-tosa-to-kea`, `-linalg-to-kea` |
 | pass (L1 → L1) | `-kea-fuse[=report-stats=true]` |
 | pass (misc) | `-kea-annotate[=marker=npu]`, `-kea-canonicalize-events` |
+| tool (backend) | `kea-translate` -- see [docs/CODEGEN.md](../docs/CODEGEN.md) |
 
 **NB: the buffer-level matrix multiply is `kea.mm`, not `kea.matmul`.** The
 spike called it `kea.matmul`; ADR-0002 gives that name to the Level 1 tensor op

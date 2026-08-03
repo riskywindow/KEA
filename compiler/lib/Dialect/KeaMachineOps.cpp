@@ -348,6 +348,34 @@ LogicalResult AllocOp::verify() {
                          "resolved by the assembler, not an allocation");
   }
 
+  // `addr` used to be a discardable `kea.addr`. Accepting the old spelling
+  // silently would mean dropping the base address on the floor, which produces
+  // a program that addresses byte 0 of every scratchpad -- so say so.
+  if (getOperation()->getDiscardableAttr("kea.addr"))
+    return emitOpError("`kea.addr` was promoted to the declared attribute "
+                       "`addr`; write `addr = <n> : i64`");
+
+  if (auto addr = getAddr()) {
+    // The unit is the space's own addressing unit: bytes for SPM_A/SPM_W/DRAM,
+    // int32 words for ACC (docs/DIALECT_L2.md §4.1.1).
+    const char *unit =
+        t.getAddressSpace() == AddressSpace::ACC ? "int32 words" : "bytes";
+    if (*addr < 0)
+      return emitOpError("base address must be non-negative, got ") << *addr;
+    if (*addr % getAlignment() != 0)
+      return emitOpError("base address ")
+             << *addr << " is not a multiple of the buffer's alignment "
+             << getAlignment() << " " << unit
+             << "; an aligned displacement only implies an aligned "
+                "base + displacement if the base is aligned too "
+                "(docs/DIALECT_L2.md §4.1.1)";
+    if (*addr + getExtent() > cap)
+      return emitOpError("placed at ")
+             << *addr << " it runs to " << (*addr + getExtent()) << " "
+             << unit << ", past the " << cap << " " << unit << " of "
+             << spaceName(t.getAddressSpace());
+  }
+
   return success();
 }
 

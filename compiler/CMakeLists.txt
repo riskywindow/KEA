@@ -83,5 +83,9 @@ add_subdirectory(include/kea/Transforms)
 add_subdirectory(lib/Dialect)
 add_subdirectory(lib/Conversion)
 add_subdirectory(lib/Transforms)
+# The backend (ADR-0001): Level 2 IR -> .kasm + .weights.bin + .map.json.
+# include/kea/Target/Kasm holds only a hand-written header, so no CMakeLists.
+add_subdirectory(lib/Target/Kasm)
 add_subdirectory(tools/kea-opt)
+add_subdirectory(tools/kea-translate)
 add_subdirectory(test)

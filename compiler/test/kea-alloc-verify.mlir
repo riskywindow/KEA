@@ -1,7 +1,7 @@
 // RUN: kea-opt %s -split-input-file -kea-alloc=verify-only=true -verify-diagnostics
 //
 // The overlap verifier, run standalone over a placement this pass did not
-// produce (`verify-only=true` reads the `kea.addr` already in the IR instead of
+// produce (`verify-only=true` reads the `addr` already in the IR instead of
 // creating one).
 //
 // The property is: no two buffers whose live ranges overlap may have been given
@@ -20,14 +20,14 @@
 // exists to catch, and it is what a subtly wrong packer would produce.
 //
 // The allocating path recomputes the placement and overwrites the bad
-// `kea.addr`, so this function is only interesting under `verify-only=true` --
+// `addr`, so this function is only interesting under `verify-only=true` --
 // hence the check prefix.
 
 func.func @aliasing_placement() {
   // expected-error @+1 {{aliases 'bad.b': 'bad.a' occupies [0, 1024) of SPM_A over live range [0, 2] and 'bad.b' occupies [512, 1536) over [1, 2]; the ranges overlap, so the storage must not}}
-  %a = kea.alloc {name = "bad.a", role = "scratch", kea.addr = 0 : i64}
+  %a = kea.alloc {name = "bad.a", role = "scratch", addr = 0 : i64}
     : !kea.buffer<1024xi8, A>
-  %b = kea.alloc {name = "bad.b", role = "scratch", kea.addr = 512 : i64}
+  %b = kea.alloc {name = "bad.b", role = "scratch", addr = 512 : i64}
     : !kea.buffer<1024xi8, A>
   kea.vcopy from %a : !kea.buffer<1024xi8, A>, to %b
     {src_addr = 0, dst_addr = 0, row_bytes = 512, rows = 1,
@@ -46,10 +46,17 @@ func.func @aliasing_placement() {
 // (ISA.md §11.1). At 8 it is not -- and note the second diagnostic: the
 // displacement `w_addr = 16` is legal on its own, which is exactly why the
 // absolute `8 + 16 = 24` has to be re-checked rather than assumed.
+//
+// The declared `alignment = 8` is deliberate: it is the *floor* the op verifier
+// checks (`addr % alignment == 0`, which 8 satisfies), so the alignment this
+// case is about is the stronger 16 that `-kea-alloc` DERIVES from the `LOAD_W`
+// use. Declaring 16 here would make the op verifier reject the base at parse
+// time and this test would never reach the pass it is written for.
 
 func.func @misaligned_base() {
   // expected-error @+1 {{base address 8 is not a multiple of 16 bytes, which SPM_W requires for this buffer (ISA.md §11.1)}}
-  %w = kea.alloc {name = "bad.w", role = "scratch", kea.addr = 8 : i64}
+  %w = kea.alloc {name = "bad.w", role = "scratch", alignment = 8 : i64,
+                  addr = 8 : i64}
     : !kea.buffer<512xi8, W>
   // expected-error @+1 {{absolute w_addr = 8 + 16 = 24 is not a multiple of 16 bytes (ISA.md §11.1)}}
   kea.load_w %w {w_addr = 16, w_row_stride = 16, k_rows = 16, n_cols = 16,

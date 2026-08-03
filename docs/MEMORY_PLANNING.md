@@ -37,7 +37,7 @@ carries a `name`, a `role`, an `alignment`, and — for on-chip buffers — a
 This pass adds exactly one thing: a **base address**.
 
 ```mlir
-%t = kea.alloc {kea.addr = 2064 : i64, live = array<i64: 17, 26>,
+%t = kea.alloc {addr = 2064 : i64, live = array<i64: 17, 26>,
                 name = "block.0.atile", role = "scratch"} : !kea.buffer<272xi8, A>
 ```
 
@@ -50,7 +50,7 @@ DIALECT_L2.md §1.1(a) defines an address in the instruction stream as a
 instr.X_addr = base(X) + X_addr
 ```
 
-`kea.addr` is `base(X)`. The displacements are deliberately left alone.
+`addr` is `base(X)`. The displacements are deliberately left alone.
 
 That is not only the documented contract, it is forced. The Level 2 op verifiers
 check that **every strided walk stays inside its buffer** — a `kea.mm` whose
@@ -60,9 +60,18 @@ look out of bounds, and would destroy the one check that catches a tiling bug.
 Keeping the two separate means the bounds check stays meaningful right up to
 `-kea-emit`, and the pass's output re-verifies as ordinary Level 2 IR.
 
-`kea.addr` is a dialect-prefixed *discardable* attribute: `kea.alloc`'s ODS does
-not declare it, and this pass does not own the op definition. Promoting it to a
-declared optional attribute would be a small improvement and is noted in §9.
+`addr` is a **declared** `OptionalAttr<Kea_I64>` on `kea.alloc`
+(`KeaMachineOps.td`), so this pass gets a typed accessor and the op verifier
+checks the base against the buffer's `alignment` and its space's capacity as
+soon as it is set. It was a discardable `kea.addr` until `-kea-emit` landed;
+the old spelling is now rejected outright rather than silently ignored, because
+a base address that quietly does not reach the backend produces a program that
+addresses byte 0 of every scratchpad.
+
+The op verifier is only the floor: it can check `addr % alignment == 0` and
+nothing more, because `alignment` is a declared floor and the *real*
+requirement is derived from the ops that use the buffer (§4.2). That derivation
+and the absolute-address re-check stay this pass's job.
 
 ---
 
@@ -394,7 +403,7 @@ It checks four things:
 * **Absolute addresses**, `base + displacement`, against ISA.md §11.1 —
   independently of how the base was chosen.
 
-`-kea-alloc=verify-only=true` runs only the verifier, over the `kea.addr`
+`-kea-alloc=verify-only=true` runs only the verifier, over the `addr`
 already in the IR, allocating nothing. That makes it a checker for IR this pass
 did not produce, and it is how a hand-corrupted allocation is tested
 (`kea-alloc-verify.mlir`). `kea-alloc-e2e.mlir` pipes the finished MobileNetV2
@@ -418,8 +427,8 @@ FileCheck-testable:
 
 | attribute | mirrors | consumer |
 |---|---|---|
-| `kea.addr` (on each `kea.alloc`) | — | `-kea-emit`: `base(X)` |
-| `kea.dram_layout` | `KeafDramLayout`, field for field | `-kea-emit` → `model.map.json` `dram` → the `DRAM_LAYOUT` section |
+| `addr` (on each `kea.alloc`) | — | `-kea-emit`: `base(X)`; declared in `KeaMachineOps.td`, so the op verifier checks it too |
+| `kea.dram_layout` | `KeafDramLayout`, field for field | `-kea-emit` → `model.map.json` `dram` → the `DRAM_LAYOUT` section (see [CODEGEN.md](CODEGEN.md) §5) |
 | `kea.spm_map` | `KeafSpmEntry`, field for field | `-kea-emit` → `model.map.json` `spm_map` → the `SPM_MAP` section |
 | `kea.occupancy` | — | humans, and the regression tests |
 
@@ -443,11 +452,6 @@ plots have something to plot.
 
 Stated plainly rather than stubbed.
 
-* **`kea.addr` is a discardable attribute, not a declared one.** It should be an
-  `OptionalAttr<Kea_I64>:$addr` on `kea.alloc`, which would let the op verifier
-  enforce alignment and capacity on the base directly and would give
-  `-kea-emit` a typed accessor instead of a string lookup. That is a change to
-  `KeaMachineOps.td`, which this pass does not own.
 * **One arena per function.** `kea.dram_layout` is attached per `func.func`. A
   module with several NPU entry points would need a module-level pass to merge
   the arenas, or would get one arena per function with colliding offsets.

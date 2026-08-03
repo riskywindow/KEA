@@ -13,7 +13,7 @@
 #
 # Instead this script implements the small subset of lit that our tests need:
 # it scans each .mlir file for `// RUN:` lines and executes them, with the
-# usual `%s` / `%t` substitutions. The tests are therefore written in ordinary
+# usual `%s` / `%S` / `%t` substitutions. The tests are therefore written in ordinary
 # lit syntax and will run unmodified under real lit the day someone does
 # `pip install lit` and switches compiler/test/CMakeLists.txt over to
 # add_lit_testsuite(); see compiler/README.md.
@@ -74,6 +74,9 @@ for test_file in "${TEST_DIR}"/*.mlir; do
   output=""
   for run_line in "${run_lines[@]}"; do
     cmd="${run_line//%s/${test_file}}"
+    # %S is lit's "directory containing the test", which end-to-end tests need
+    # to reach the shared fixtures in tests/mlir and the native build.
+    cmd="${cmd//%S/${TEST_DIR}}"
     cmd="${cmd//%t/${TMP_ROOT}/${name}.tmp}"
     if ! output="$(bash -o pipefail -c "${cmd}" 2>&1)"; then
       ok=0

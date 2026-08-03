@@ -20,7 +20,7 @@
 //     (include/kea/keaf.h): constants, host I/O, and a live-range packed
 //     intermediate-activation scratch region.
 //
-// Addresses are stamped as `kea.addr` on the `kea.alloc`, not folded into the
+// Addresses are stamped as `addr` on the `kea.alloc`, not folded into the
 // per-op displacements. That is docs/DIALECT_L2.md §1.1(a)'s contract --
 // `-kea-emit` writes `instr.X_addr = base(X) + X_addr` -- and it is also forced:
 // the Level 2 verifiers check that every strided walk stays inside its buffer,
@@ -69,7 +69,7 @@ namespace {
 
 /// The base address `-kea-emit` adds to every displacement into this buffer.
 /// Bytes in SPM_A / SPM_W / DRAM, int32 words in ACC.
-constexpr StringLiteral kAddr = "kea.addr";
+constexpr StringLiteral kAddr = "addr";
 /// Mirrors the KEAF `SPM_MAP` section / model.map.json `spm_map` (debug).
 constexpr StringLiteral kSpmMap = "kea.spm_map";
 /// Mirrors `KeafDramLayout` / model.map.json `dram` (load bearing, not debug).
@@ -899,9 +899,9 @@ void KeaAllocPass::runOnOperation() {
       failed(placeDram(buffers, numPositions)))
     return signalPassFailure();
 
-  // Stamp the answer. `kea.addr` is dialect-prefixed and therefore a
-  // discardable attribute: `kea.alloc`'s ODS does not declare it, and this pass
-  // does not own the op definition.
+  // Stamp the answer. `addr` is a declared optional attribute on `kea.alloc`
+  // (KeaMachineOps.td), so the op verifier checks the base against the
+  // buffer's alignment and capacity as soon as it is set.
   OpBuilder b(func.getContext());
   for (Buffer &buf : buffers)
     buf.alloc->setAttr(kAddr, b.getI64IntegerAttr(buf.offset));

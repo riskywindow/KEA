@@ -4,7 +4,7 @@
 // -kea-alloc: symbolic Level 2 buffers -> absolute, compile-time-constant
 // addresses. docs/MEMORY_PLANNING.md is the write-up.
 //
-// The address is stamped as `kea.addr` on the `kea.alloc` rather than folded
+// The address is stamped as `addr` on the `kea.alloc` rather than folded
 // into the per-op displacements, because docs/DIALECT_L2.md §1.1(a) defines an
 // address as a `(buffer, displacement)` pair and `-kea-emit` writes
 // `base(X) + X_addr`. Folding would also break the Level 2 in-bounds verifiers,
@@ -37,10 +37,10 @@
 // CHECK-LABEL: func.func @share_and_separate
 // CHECK-SAME:  spm_a = {buffers = 3 : i64, capacity = 262144 : i64, fragmentation = 0 : i64, maxlive = 2048 : i64, peak = 2048 : i64, unpacked = 3072 : i64}
 func.func @share_and_separate() {
-  // CHECK: kea.alloc {kea.addr = 0 : i64, live = array<i64: 0, 3>, name = "p.a"
+  // CHECK: kea.alloc {addr = 0 : i64, live = array<i64: 0, 3>, name = "p.a"
   %a = kea.alloc {name = "p.a", role = "scratch"} : !kea.buffer<1024xi8, A>
   // %b overlaps %a, so it is pushed past the end of it: 0 + 1024 = 1024.
-  // CHECK: kea.alloc {kea.addr = 1024 : i64, live = array<i64: 1, 3>, name = "p.b"
+  // CHECK: kea.alloc {addr = 1024 : i64, live = array<i64: 1, 3>, name = "p.b"
   %b = kea.alloc {name = "p.b", role = "scratch"} : !kea.buffer<1024xi8, A>
 
   kea.vcopy from %a : !kea.buffer<1024xi8, A>, to %b
@@ -53,7 +53,7 @@ func.func @share_and_separate() {
   // THE POINT: %c is born after %a died, so it lands on top of %a at 0. This
   // one line is the difference between a 3 KiB program and a 2 KiB one, and on
   // a real network it is the difference between fitting and not.
-  // CHECK: kea.alloc {kea.addr = 0 : i64, live = array<i64: 4, 5>, name = "p.c"
+  // CHECK: kea.alloc {addr = 0 : i64, live = array<i64: 4, 5>, name = "p.c"
   %c = kea.alloc {name = "p.c", role = "scratch"} : !kea.buffer<1024xi8, A>
   kea.vcopy to %c {fill, fill_value = 0, src_addr = 0, dst_addr = 0,
                    row_bytes = 1024, rows = 1, src_row_stride = 0,
@@ -63,9 +63,9 @@ func.func @share_and_separate() {
 }
 
 // REVERIFY-LABEL: func.func @share_and_separate
-// REVERIFY: kea.addr = 0 : i64
-// REVERIFY: kea.addr = 1024 : i64
-// REVERIFY: kea.addr = 0 : i64
+// REVERIFY: addr = 0 : i64
+// REVERIFY: addr = 1024 : i64
+// REVERIFY: addr = 0 : i64
 
 // -----
 
@@ -91,10 +91,10 @@ func.func @acc_is_words() {
   %a = kea.alloc {name = "w.a", role = "scratch"} : !kea.buffer<1616xi8, A>
   %wt = kea.alloc {name = "w.wt", role = "scratch"} : !kea.buffer<256xi8, W>
 
-  // CHECK: kea.alloc {kea.addr = 0 : i64, {{.*}}name = "w.big"{{.*}} : !kea.buffer<1030xi32, ACC>
+  // CHECK: kea.alloc {addr = 0 : i64, {{.*}}name = "w.big"{{.*}} : !kea.buffer<1030xi32, ACC>
   %big = kea.alloc {name = "w.big", role = "scratch"} : !kea.buffer<1030xi32, ACC>
   // 1030 is not a multiple of 16, so the next ACC base is 1040, not 1030.
-  // CHECK: kea.alloc {kea.addr = 1040 : i64, {{.*}}name = "w.small"{{.*}} : !kea.buffer<512xi32, ACC>
+  // CHECK: kea.alloc {addr = 1040 : i64, {{.*}}name = "w.small"{{.*}} : !kea.buffer<512xi32, ACC>
   %small = kea.alloc {name = "w.small", role = "scratch"} : !kea.buffer<512xi32, ACC>
 
   kea.load_w %wt {w_addr = 0, w_row_stride = 16, k_rows = 16, n_cols = 16,
@@ -133,11 +133,11 @@ func.func @alignment_is_derived() {
   %act = kea.alloc {name = "d.act", role = "scratch"} : !kea.buffer<1616xi8, A>
 
   // Only ever a VQUANT qparam block: 4-byte alignment is enough, and 0 is.
-  // CHECK: kea.alloc {alignment = 4 : i64, kea.addr = 0 : i64, {{.*}}name = "d.params"
+  // CHECK: kea.alloc {addr = 0 : i64, alignment = 4 : i64, {{.*}}name = "d.params"
   %params = kea.alloc {name = "d.params", role = "scratch", alignment = 4}
     : !kea.buffer<600xi8, W>
   // Fed to LOAD_W: 16 bytes, so 608 rather than the declared 4's 600.
-  // CHECK: kea.alloc {alignment = 4 : i64, kea.addr = 608 : i64, {{.*}}name = "d.tile"
+  // CHECK: kea.alloc {addr = 608 : i64, alignment = 4 : i64, {{.*}}name = "d.tile"
   %tile = kea.alloc {name = "d.tile", role = "scratch", alignment = 4}
     : !kea.buffer<512xi8, W>
 
@@ -184,19 +184,19 @@ func.func @alignment_is_derived() {
 // CHECK-SAME:  dram_scratch = {buffers = 2 : i64, capacity = 1024 : i64, fragmentation = 0 : i64, maxlive = 1024 : i64, peak = 1024 : i64, unpacked = 2048 : i64}
 func.func @dram_arena() {
   // Region 2 (I/O) starts at 64-byte alignment past the constants: 512 -> 512.
-  // CHECK: kea.alloc {kea.addr = 512 : i64, name = "m.in", role = "input"}
+  // CHECK: kea.alloc {addr = 512 : i64, name = "m.in", role = "input"}
   %in = kea.alloc {name = "m.in", role = "input"} : !kea.buffer<256xi8, DRAM>
-  // CHECK: kea.alloc {kea.addr = 768 : i64, name = "m.out", role = "output"}
+  // CHECK: kea.alloc {addr = 768 : i64, name = "m.out", role = "output"}
   %out = kea.alloc {name = "m.out", role = "output"} : !kea.buffer<256xi8, DRAM>
   // Region 1 (constants), laid out in program order from 0.
-  // CHECK: kea.alloc {kea.addr = 0 : i64, {{.*}}name = "m.weights", role = "weights"}
+  // CHECK: kea.alloc {addr = 0 : i64, {{.*}}name = "m.weights", role = "weights"}
   %w = kea.alloc {name = "m.weights", role = "weights"} : !kea.buffer<512xi8, DRAM>
 
   // Region 3 (activation scratch), 64-byte aligned past the I/O region.
-  // CHECK: kea.alloc {kea.addr = 1024 : i64, name = "m.l0", role = "activation"}
+  // CHECK: kea.alloc {addr = 1024 : i64, name = "m.l0", role = "activation"}
   %l0 = kea.alloc {name = "m.l0", role = "activation"} : !kea.buffer<1024xi8, DRAM>
   // SAME ADDRESS as m.l0: their live ranges do not overlap.
-  // CHECK: kea.alloc {kea.addr = 1024 : i64, name = "m.l1", role = "activation"}
+  // CHECK: kea.alloc {addr = 1024 : i64, name = "m.l1", role = "activation"}
   %l1 = kea.alloc {name = "m.l1", role = "activation"} : !kea.buffer<1024xi8, DRAM>
 
   %sa = kea.alloc {name = "m.sa", role = "scratch"} : !kea.buffer<1024xi8, A>

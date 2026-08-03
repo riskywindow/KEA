@@ -183,6 +183,82 @@ def KeaTile : Pass<"kea-tile", "::mlir::func::FuncOp"> {
   let dependentDialects = ["::mlir::kea::KeaDialect", "::mlir::arith::ArithDialect"];
 }
 
+def KeaSchedule : Pass<"kea-schedule", "::mlir::func::FuncOp"> {
+  let summary = "Assign queues, double-buffer DMA and insert the semaphores";
+  let description = [{
+    The pass that makes the hardware's concurrency real. In: the correct
+    *sequential* Level 2 program `-kea-tile` emits. Out: the same instructions,
+    reordered into a *concurrent* one -- a queue on every instruction, DMA
+    spread over both engines, loads hoisted above the previous tile's compute,
+    stores sunk below the next tile's, and exactly the `kea.signal` /
+    `kea.wait` pairs the real dependencies need.
+
+    Runs BEFORE `-kea-alloc` (ADR-0002's amendment): hoisting a DMA extends its
+    buffer's live range until it overlaps its predecessor's, and the allocator
+    then separates them for the ordinary reason. Double buffering is expressed
+    entirely as a live-range extension. The full algorithm is
+    docs/SCHEDULING.md.
+
+    What it guarantees:
+
+    * **Rule D** (ISA.md §5.5) by construction, not by repair: every `kea.wait`
+      is preceded in stream order by the `kea.signal`s that supply its counts,
+      because events are per-(producer queue, consumer queue) token channels
+      and a signal is placed adjacent to a producer that a topological order
+      already put before the consumer. Re-checked before the pass returns.
+    * **The weight-bank invariant** (DIALECT_L2.md §6.1): MXU instructions are
+      never reordered relative to each other, and nothing is inserted between a
+      `kea.load_w` and the `kea.mm` that reads its bank.
+    * **ADR-0002's soundness obligation**: if two operations can execute
+      concurrently, every buffer they touch has overlapping block-order live
+      ranges, so `-kea-alloc` can never alias them into a data race. Discharged
+      by hoisting each on-chip `kea.alloc` to the earliest stream position that
+      may run concurrently with one of its users.
+    * **Queue depth** (`KEA_QUEUE_DEPTH`, 16) and scratchpad capacity are
+      modelled while scheduling, so a prefetch is never hoisted so far that it
+      wedges the in-order dispatcher or overflows a scratchpad.
+
+    Pre-existing `kea.signal` / `kea.wait` ops are erased and recomputed, so
+    the pass is idempotent and can be re-run on its own output.
+  }];
+
+  let options = [
+    // The A/B control for the measurement in docs/SCHEDULING.md: `serial`
+    // keeps -kea-tile's order, puts every DMA on one engine and synchronizes
+    // every cross-queue adjacency, i.e. it runs the sequential program as a
+    // sequential program. It is what `overlap` is measured against.
+    Option<"mode", "mode", "std::string", /*default=*/"\"overlap\"",
+           "overlap (default) or serial -- the unscheduled baseline">,
+    // KEA_QUEUE_DEPTH from hw_config.h. Overridable only so a test can force
+    // the backpressure path on a small program.
+    Option<"queueDepth", "queue-depth", "int64_t", /*default=*/"0",
+           "Modelled per-queue depth; 0 means KEA_QUEUE_DEPTH from "
+           "hw_config.h">,
+    // kea.load_w / kea.mm / kea.dwconv / kea.v* have no `unit` field in
+    // KeaMachineOps.td -- their queue follows from the opcode, which is
+    // stronger than an attribute. This stamps the derived queue as a
+    // discardable `kea.unit` attribute anyway so the assignment is readable
+    // and FileCheck-testable. It is advisory; -kea-emit must not need it.
+    Option<"annotateUnits", "annotate-units", "bool", /*default=*/"true",
+           "Stamp the derived queue on fixed-unit ops as `kea.unit`">,
+    // Statistics are inert on this LLVM install (Release+NDEBUG =>
+    // NoopStatistic, compiler/README.md gotcha 21a), so the numbers that
+    // matter are published as an attribute instead.
+    Option<"reportSchedule", "report-schedule", "bool", /*default=*/"false",
+           "Attach kea.schedule (per-queue occupancy, modelled cycles, queue "
+           "high-water marks, event count) to the function">,
+  ];
+
+  let statistics = [
+    Statistic<"numSignals", "num-signals", "kea.signal ops inserted">,
+    Statistic<"numWaits", "num-waits", "kea.wait ops inserted">,
+    Statistic<"numHoisted", "num-hoisted",
+              "instructions that moved earlier than -kea-tile emitted them">,
+  ];
+
+  let dependentDialects = ["::mlir::kea::KeaDialect"];
+}
+
 def KeaAlloc : Pass<"kea-alloc", "::mlir::func::FuncOp"> {
   let summary = "Assign every KEA Level 2 buffer a compile-time-constant address";
   let description = [{

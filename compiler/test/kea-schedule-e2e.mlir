@@ -1,106 +1,74 @@
-// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile -kea-alloc | FileCheck %s
-// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile -kea-alloc | kea-opt -kea-alloc=verify-only=true | FileCheck %s --check-prefix=REVERIFY
+// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile -kea-schedule -kea-alloc | FileCheck %s
+// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile -kea-schedule -kea-alloc | kea-opt -kea-alloc=verify-only=true | FileCheck %s --check-prefix=REVERIFY
+// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile -kea-schedule=report-schedule=true | FileCheck %s --check-prefix=REPORT
+// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile -kea-schedule | kea-opt -kea-tile | FileCheck %s --check-prefix=REVALIDATE
 //
-// END-TO-END: quantized TOSA -> a program in which every scratchpad and DRAM
-// address is a compile-time constant. There is no allocator at run time.
+// END-TO-END: a complete MobileNetV2 inverted-residual block in quantized
+// TOSA, all the way through `-tosa-to-kea -kea-fuse -kea-tile -kea-schedule
+// -kea-alloc`. The source is a verbatim copy of
+// tests/mlir/tosa/mobilenet_block.mlir, which lives outside compiler/test
+// where run_tests.sh looks; compiler/test/kea-alloc-e2e.mlir carries the same
+// copy for the pass before this one.
 //
-// The source below is a verbatim copy of tests/mlir/tosa/mobilenet_block.mlir,
-// which is read-only reference material and lives outside compiler/test, where
-// run_tests.sh looks. compiler/test/mobilenet-e2e.mlir carries the same source
-// and asserts the Level 1 fusion and the tiling; this file picks up where that
-// one stops and asserts the memory plan.
+// What each RUN line proves:
 //
-// The second RUN line re-runs the overlap verifier over the finished program
-// from scratch, so the pipeline proves its own output free of aliasing.
+//   1. the scheduled program still allocates -- the live ranges the scheduler
+//      widened to discharge ADR-0002's soundness obligation still fit, which
+//      is exactly what `-kea-tile`'s `spm-reserve-factor = 2` reserved room
+//      for;
+//   2. re-running `-kea-alloc` in verify-only mode re-proves from scratch that
+//      no two overlapping-live-range buffers share storage;
+//   3. the schedule report: both DMA engines carry work, the depth-16 queues
+//      are respected, and the whole block needs 18 of the 32 events;
+//   4. running `-kea-tile` over already-Level-2 IR re-runs `verifyWeightBanks`
+//      and `refreshLiveRanges` (DIALECT_L2.md §2), so errata E7 and the
+//      live-range stamps are re-checked after all the motion.
+//
+// Note what is NOT here: any mention of double buffering in `-kea-alloc`'s
+// output. The allocator separates the tiles because their ranges overlap, full
+// stop -- ADR-0002's amendment in one line of test output.
 
-// MobileNetV2 inverted-residual block, fully quantized int8, in TOSA.
-// Verified to round-trip through mlir-opt on LLVM/MLIR 20.1.6.
-//
-// This is THE integration test for the compiler. Structure:
-//
-//   x (i8, 1x8x8x4)
-//     |-------------------------------.            (identity / residual path)
-//     v                               |
-//   1x1 conv expand   4 -> 24 ch       |
-//   rescale i32 -> i8 (per-channel)    |
-//   clamp ReLU6                        |
-//     v                               |
-//   3x3 depthwise, stride 1, pad 1     |
-//   rescale i32 -> i8 (per-channel)    |
-//   clamp ReLU6                        |
-//     v                               |
-//   1x1 conv project  24 -> 4 ch       |
-//   rescale i32 -> i8 (per-channel)    |
-//     v                               |
-//   +<------------------------------- '
-//   (quantized add: rescale both sides to a common i32 domain, add, rescale)
-//     v
-//   y (i8, 1x8x8x4)
-//
-// Quantization conventions used here:
-//   * Activation zero point after ReLU6 is -128 (the "unsigned-like" encoding),
-//     so clamp min_int = -128 clamps exactly at the quantized zero.
-//   * Block input/output zero point is -5, a general signed-affine activation.
-//   * Weight zero point is 0 throughout (symmetric weight quantization), which
-//     is what per-channel PTQ produces and what most NPUs require.
-//   * Weight rescales are PER-CHANNEL, matching per-channel weight scales.
-//   * The projection output is NOT followed by a ReLU -- that is the defining
-//     "linear bottleneck" property of MobileNetV2.
-
-//===--------------------------------------------------------------------===//
-// The memory plan for the inverted residual block
-//===--------------------------------------------------------------------===//
-//
-// Everything on this line is decided at compile time and nothing is decided
-// again later. Reading the occupancy dictionary, per space:
-//
-//   SPM_A   peak 5,280 of 262,144 bytes   (2.0% of capacity)
-//   SPM_W   peak   896 of 262,144 bytes   (0.3%)
-//   ACC     peak 2,048 of  32,768 words   (6.3%)
-//
-// `unpacked` is what an allocator that never shared storage would have needed,
-// so packing turns 11,248 bytes of SPM_A into 5,280 and 5,120 ACC words into
-// 2,048 -- a 2.1x and 2.5x reduction. `fragmentation` is `peak - maxlive`, and
-// it is ZERO in every space: on this block the greedy packer is provably
-// optimal, because no allocator can beat the largest amount of simultaneously
-// live data.
-//
-// The tiles are small relative to capacity because -kea-tile only ever spends
-// half of each scratchpad (spm-reserve-factor, default 2) and this block's
-// tensors are 8x8; the ratios, not the absolute numbers, are the result.
-
-// The attributes print in alphabetical order, so kea.dram_layout comes first:
-// the DRAM arena the runtime must hand the device, and the only allocation that
-// happens anywhere in the system -- one contiguous block of 4,352 bytes.
+// The three layers keep their TRACE brackets, on the queue that does their
+// arithmetic: MXU for the two 1x1 convolutions, DWU for the depthwise.
 // CHECK-LABEL: func.func @mobilenet_v2_inverted_residual(
-// CHECK-SAME:  kea.dram_layout = {alignment = 64 : i64, const_bytes = 2292 : i64, const_offset = 0 : i64, io_bytes = 512 : i64, io_offset = 2304 : i64, scratch_bytes = 1536 : i64, scratch_offset = 2816 : i64, total_bytes = 4352 : i64}
-// CHECK-SAME:  acc = {buffers = 3 : i64, capacity = 32768 : i64, fragmentation = 0 : i64, maxlive = 2048 : i64, peak = 2048 : i64, unpacked = 5120 : i64}
-// CHECK-SAME:  dram_scratch = {buffers = 2 : i64, capacity = 1536 : i64, fragmentation = 0 : i64, maxlive = 1536 : i64, peak = 1536 : i64, unpacked = 3072 : i64}
-// CHECK-SAME:  spm_a = {buffers = 7 : i64, capacity = 262144 : i64, fragmentation = 0 : i64, maxlive = 5280 : i64, peak = 5280 : i64, unpacked = 11248 : i64}
-// CHECK-SAME:  spm_w = {buffers = 7 : i64, capacity = 262144 : i64, fragmentation = 0 : i64, maxlive = 896 : i64, peak = 896 : i64, unpacked = 2292 : i64}
-
-// The block input and output are in the I/O region; the host binds them by name
-// and they are never packed against anything.
-// CHECK: kea.alloc {addr = 2304 : i64, name = "{{.*}}.input0", role = "input"}
-
-// THE INTER-LAYER ACTIVATIONS SHARE ONE BUFFER. Layer 0 writes @0.out and
-// layer 1 reads it; layer 1 writes @1.out and layer 2 reads it. The two ranges
-// are disjoint, so both land at 2816. On a 50-layer network this is the
-// difference between an arena of a few buffers and an arena of fifty.
-// CHECK: kea.alloc {addr = 2816 : i64, name = "{{.*}}.0.out", role = "activation"}
-// CHECK: kea.alloc {addr = 2816 : i64, name = "{{.*}}.1.out", role = "activation"}
-
-// Weights and quantization parameters are in the const region from offset 0, in
-// the order -kea-emit must write the CONST blob.
-// CHECK: kea.alloc {{.*}}{addr = 0 : i64, {{.*}}role = "weights"}
-
-// Every ACC base is a multiple of 16 WORDS. The two layer-0/layer-1 ACC regions
-// have disjoint live ranges, so both sit at 0.
-// CHECK: kea.alloc {addr = 0 : i64, {{.*}}.0.acc"{{.*}} : !kea.buffer<2048xi32, ACC>
-// CHECK: kea.alloc {addr = 0 : i64, {{.*}}.1.acc"{{.*}} : !kea.buffer<2048xi32, ACC>
+// CHECK-DAG: kea.trace "begin" 0 {unit = "MXU"}
+// CHECK-DAG: kea.trace "begin" 1 {unit = "DWU"}
+// CHECK-DAG: kea.trace "begin" 2 {unit = "MXU"}
+// CHECK-DAG: kea.trace "end" 2 {unit = "MXU"}
+// Both DMA engines are used, every instruction has a queue, and the
+// semaphores are there.
+// CHECK-DAG: kea.dma_load {{.*}}unit = "DMA0"
+// CHECK-DAG: kea.dma_load {{.*}}unit = "DMA1"
+// CHECK-DAG: kea.dma_store {{.*}}unit = "DMA0"
+// CHECK-DAG: kea.dma_store {{.*}}unit = "DMA1"
+// CHECK-DAG: kea.dwconv {{.*}}kea.unit = "DWU"
+// CHECK-DAG: kea.vadd {{.*}}kea.unit = "VPU"
+// CHECK-DAG: kea.signal
+// CHECK-DAG: kea.wait
+// Every buffer got an address and the whole block fits with room to spare.
+// CHECK: addr =
+// CHECK: kea.halt
 
 // REVERIFY-LABEL: func.func @mobilenet_v2_inverted_residual(
 // REVERIFY: addr =
+
+// REPORT-LABEL: func.func @mobilenet_v2_inverted_residual(
+// One pass of the capacity fixpoint: the buffers-in-flight bound each space
+// started from was admissible first time.
+// REPORT-SAME:  capacity_iters = 1 : i64
+// REPORT-SAME:  events = 18 : i64
+// REPORT-SAME:  queue_depth = 16 : i64
+// Both engines carry real DRAM traffic, and neither queue reaches its depth.
+// REPORT-SAME:  DMA0 = {busy = {{[1-9][0-9]*}} : i64, dram_bytes = {{[1-9][0-9]*}} : i64
+// REPORT-SAME:  DMA1 = {busy = {{[1-9][0-9]*}} : i64, dram_bytes = {{[1-9][0-9]*}} : i64
+// The whole block needs well under either scratchpad even with the widened
+// ranges: 8144 of 262144 bytes of SPM_A.
+// REPORT-SAME:  spm_a_peak = 8144 : i64
+// REPORT-SAME:  spm_w_peak = 2292 : i64
+
+// REVALIDATE-LABEL: func.func @mobilenet_v2_inverted_residual(
+// REVALIDATE: kea.load_w
+// REVALIDATE: kea.mm
 
 func.func @mobilenet_v2_inverted_residual(%x: tensor<1x8x8x4xi8>) -> tensor<1x8x8x4xi8> {
 
@@ -279,13 +247,7 @@ func.func @mobilenet_v2_inverted_residual(%x: tensor<1x8x8x4xi8>) -> tensor<1x8x
 // would not have compiled at all, so these CHECK lines are a regression guard
 // on the packing quality rather than on legality.
 
-// CHECK-LABEL: func.func @mobilenet_v2_inverted_residual_stride2(
-// CHECK-SAME:  acc = {buffers = 3 : i64, capacity = 32768 : i64, fragmentation = 0 : i64, maxlive = 2048 : i64, peak = 2048 : i64, unpacked = 2816 : i64}
-// CHECK-SAME:  spm_a = {buffers = 6 : i64, capacity = 262144 : i64, fragmentation = 0 : i64, maxlive = 3136 : i64, peak = 3136 : i64, unpacked = 6144 : i64}
-// CHECK-SAME:  spm_w = {buffers = 6 : i64, capacity = 262144 : i64, fragmentation = 0 : i64, maxlive = 896 : i64, peak = 896 : i64, unpacked = 2272 : i64}
 
-// REVERIFY-LABEL: func.func @mobilenet_v2_inverted_residual_stride2(
-// REVERIFY: addr =
 
 func.func @mobilenet_v2_inverted_residual_stride2(%x: tensor<1x8x8x4xi8>)
     -> tensor<1x4x4x8xi8> {

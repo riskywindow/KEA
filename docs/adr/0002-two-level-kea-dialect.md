@@ -80,6 +80,30 @@ by `-kea-tile` — the scheduler moves ops, which shifts the block indices those
 ranges are expressed in. `mlir::kea::refreshLiveRanges()` exists for exactly
 this, and any pass that inserts, erases, or moves an L2 op must call it.
 
+### The soundness obligation this places on `-kea-schedule` (normative)
+
+Reordering into a *concurrent* program while liveness is still expressed in
+*sequential* block order creates an obligation that is easy to miss and
+catastrophic to violate:
+
+> **After `-kea-schedule`, block order must be a sound over-approximation of
+> temporal liveness. If two operations can execute concurrently — different
+> queues, with no semaphore ordering them — then every buffer they touch must
+> have overlapping block-order live ranges.**
+
+If the scheduler leaves two operations able to run at the same time but their
+buffers' block-order ranges are disjoint, `-kea-alloc` is *entitled* to place
+those buffers at the same address. The result is a data race between two
+hardware units, which surfaces as a wrong number in an output tensor with
+nothing in the instruction stream to point at.
+
+This cannot be checked from inside `-kea-alloc` — by the time it runs, the
+information about what may execute concurrently has already been discarded. It
+is the scheduler's obligation to establish and its tests' job to demonstrate.
+The practical discharge is straightforward: whenever a DMA is hoisted to overlap
+earlier work, extend the affected buffer's live range to cover everything it now
+overlaps, rather than only its own producer and consumers.
+
 ## Consequences
 
 - Each pass is independently testable with a small `.mlir` input and a FileCheck

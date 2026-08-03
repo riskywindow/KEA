@@ -1,0 +1,29 @@
+{
+  "arch": "KEA-1",
+  "isa_revision": 1,
+  "entry_pc": 0,
+
+  "dram": {
+    "total_bytes": 65536,
+    "const_offset": 0,
+    "const_bytes": 0,
+    "io_offset": 0,
+    "io_bytes": 4096,
+    "scratch_offset": 4096,
+    "scratch_bytes": 61440,
+    "alignment": 64
+  },
+
+  "tensors": [
+    { "name": "input",  "kind": "input",  "index": 0, "offset": 0,    "size_bytes": 256,
+      "shape": [1, 256], "dtype": "int8", "layout": "FLAT", "scale": 1.0, "zero_point": 0 },
+    { "name": "output", "kind": "output", "index": 0, "offset": 1024, "size_bytes": 512,
+      "shape": [1, 512], "dtype": "int8", "layout": "FLAT", "scale": 1.0, "zero_point": 0 }
+  ],
+
+  "spm_map": [
+    { "name": "echo/in",   "space": "SPM_A", "offset": 0,   "size": 256, "first_pc": 0, "last_pc": 3 },
+    { "name": "echo/copy", "space": "SPM_A", "offset": 256, "size": 256, "first_pc": 3, "last_pc": 7 },
+    { "name": "echo/fill", "space": "SPM_A", "offset": 512, "size": 256, "first_pc": 4, "last_pc": 8 }
+  ]
+}

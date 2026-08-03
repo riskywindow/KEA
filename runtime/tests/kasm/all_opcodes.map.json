@@ -1,0 +1,36 @@
+{
+  "arch": "KEA-1",
+  "isa_revision": 1,
+  "entry_pc": 0,
+
+  "dram": {
+    "total_bytes": 1048576,
+    "const_offset": 0,
+    "const_bytes": 0,
+    "io_offset": 65536,
+    "io_bytes": 458752,
+    "scratch_offset": 524288,
+    "scratch_bytes": 524288,
+    "alignment": 64
+  },
+
+  "symbols": [
+    { "name": "conv1.weights", "offset": 0,    "size": 4096 },
+    { "name": "conv1.qparams", "offset": 4096, "size": 768 }
+  ],
+
+  "tensors": [
+    { "name": "input",  "kind": "input",  "index": 0, "offset": 65536,  "size_bytes": 150528,
+      "shape": [1, 224, 224, 3], "dtype": "int8", "layout": "NHWC",
+      "scale": 0.0078125, "zero_point": -128 },
+    { "name": "output", "kind": "output", "index": 0, "offset": 262144, "size_bytes": 1000,
+      "shape": [1, 1000], "dtype": "int8", "layout": "FLAT",
+      "scale": 0.05, "zero_point": 12 }
+  ],
+
+  "spm_map": [
+    { "name": "conv1/act[buf0]",     "space": "SPM_A", "offset": 0, "size": 1600, "first_pc": 3,  "last_pc": 10 },
+    { "name": "conv1/weights[buf0]", "space": "SPM_W", "offset": 0, "size": 256,  "first_pc": 7,  "last_pc": 8 },
+    { "name": "conv1/acc",           "space": "ACC",   "offset": 0, "size": 1024, "first_pc": 8,  "last_pc": 14 }
+  ]
+}

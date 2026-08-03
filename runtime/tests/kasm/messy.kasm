@@ -1,0 +1,28 @@
+; A deliberately un-canonical listing. Everything here is legal input; the
+; disassembler normalizes all of it away. `test_roundtrip_kasm` asserts that
+; canonicalizing this file twice is a fixed point.
+#
+# Exercised here: both comment markers, labels, `.entry <label>` used before
+# the label is defined, hexadecimal literals, the optional `b` (bytes) suffix,
+# ragged whitespace, and comma-continued statements.
+
+.arch   "KEA-1"
+.isa_revision  1
+
+setup:
+    DMA0 DMA_LD spm_space=SPM_A, dram_addr=dram:0x1000, spm_addr=a:0x40,
+                len0=256, n1=4, n2=2, dram_s1=256b, dram_s2=1024b,
+                spm_s1=256b, spm_s2=1024b        ; strided tile fetch
+    DMA0   SIGNAL   event=0, inc=1
+
+loop_body:
+   MXU WAIT event=0, threshold=1
+   MXU LOAD_W w_addr=w:0, w_row_stride=0x10, k_rows=16, n_cols=16, bank=0, dtype=int8
+   MXU MATMUL a_addr=a:64, a_inner_stride=16b, a_outer_stride=0x100,
+              m_inner=8, m_outer=4,
+              acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=128w,
+              bank=0, acc_mode=overwrite, dtype=int8
+
+epilogue: CTRL HALT exit_code=0
+
+.entry setup

@@ -1,0 +1,17 @@
+.arch "KEA-1"
+.isa_revision 1
+.entry 0
+
+.event 0, "in_ready"
+.event 1, "out_ready"
+
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@input, spm_addr=a:0, len0=256, n1=1, n2=1, dram_s1=256, dram_s2=256, spm_s1=256, spm_s2=256
+  DMA0  SIGNAL  event=0, inc=1
+  VPU   WAIT    event=0, threshold=1
+  VPU   VCOPY   mode=copy, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:256, row_bytes=256, rows=1, src_row_stride=256, dst_row_stride=256, fill_value=0
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:512, row_bytes=256, rows=1, src_row_stride=0, dst_row_stride=256, fill_value=42
+  VPU   SIGNAL  event=1, inc=1
+  DMA1  WAIT    event=1, threshold=1
+  DMA1  DMA_ST  spm_space=SPM_A, dram_addr=@output, spm_addr=a:256, len0=256, n1=1, n2=1, dram_s1=256, dram_s2=256, spm_s1=256, spm_s2=256
+  DMA1  DMA_ST  spm_space=SPM_A, dram_addr=@output+256, spm_addr=a:512, len0=256, n1=1, n2=1, dram_s1=256, dram_s2=256, spm_s1=256, spm_s2=256
+  CTRL  HALT    exit_code=0

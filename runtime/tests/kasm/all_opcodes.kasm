@@ -1,0 +1,34 @@
+.arch "KEA-1"
+.isa_revision 1
+.entry 0
+
+.event 0, "a0_full"
+.event 5, "out_ready"
+.region 17, "block5/expand"
+
+  CTRL  NOP     cycles=0
+  MXU   NOP     cycles=7
+  MXU   TRACE   kind=begin, tag=17, payload=3
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@input, spm_addr=a:176, len0=16, n1=8, n2=8, dram_s1=16, dram_s2=128, spm_s1=16, spm_s2=160
+  DMA1  DMA_LD  spm_space=SPM_W, dram_addr=@conv1.weights+256, spm_addr=w:256, len0=256, n1=9, n2=1, dram_s1=256, dram_s2=2304, spm_s1=256, spm_s2=2304
+  DMA0  SIGNAL  event=0, inc=1
+  MXU   WAIT    event=0, threshold=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=16, a_outer_stride=160, m_inner=8, m_outer=8, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=128w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=8, k_rows=9, n_cols=12, bank=1, dtype=int4
+  MXU   MATMUL  a_addr=a:352, a_inner_stride=8, a_outer_stride=80, m_inner=8, m_outer=8, acc_addr=acc:1024, acc_inner_stride=16w, acc_outer_stride=128w, bank=1, acc_mode=accumulate, dtype=int4
+  DWU   DWCONV  a_addr=a:2048, w_addr=w:4096, acc_addr=acc:2048, out_h=8, out_w=8, channels=16, a_row_stride=160, a_pix_stride=16, kernel=3, stride=1, acc_mode=overwrite
+  DWU   DWCONV  a_addr=a:2048, w_addr=w:4096, acc_addr=acc:4096, out_h=4, out_w=4, channels=32, a_row_stride=320, a_pix_stride=32, kernel=5, stride=2, acc_mode=accumulate
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:8192, qparam_addr=w:8192, num_pixels=64, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-128, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   VQUANT  acc_addr=acc:1024, out_addr=a:9216, qparam_addr=w:8196, num_pixels=64, channels=32, acc_pix_stride=32w, out_pix_stride=16, out_zp=3, clamp_lo=-8, clamp_hi=7, dtype=int4
+  VPU   VADD    a_addr=a:8192, b_addr=a:9216, out_addr=a:10240, param_addr=w:12288, num_elems=1024, clamp_lo=-128, clamp_hi=127
+  VPU   VPOOL   mode=max, in_addr=a:8192, out_addr=a:16384, out_h=4, out_w=4, channels=16, kh=2, kw=2, stride_h=2, stride_w=2, in_row_stride=128, out_row_stride=64
+  VPU   VPOOL   mode=avg, in_addr=a:8192, out_addr=a:16448, out_h=1, out_w=1, channels=16, kh=7, kw=7, stride_h=1, stride_w=1, in_row_stride=112, out_row_stride=16
+  VPU   VCOPY   mode=copy, src_space=SPM_A, dst_space=SPM_W, src_addr=a:16384, dst_addr=w:16384, row_bytes=64, rows=4, src_row_stride=64, dst_row_stride=64, fill_value=0
+  VPU   VCOPY   mode=fill, src_space=SPM_W, dst_space=SPM_A, src_addr=w:0, dst_addr=a:20480, row_bytes=160, rows=10, src_row_stride=0, dst_row_stride=160, fill_value=-128
+  VPU   SIGNAL  event=5, inc=2
+  DMA1  WAIT    event=5, threshold=2
+  DMA1  DMA_ST  spm_space=SPM_A, dram_addr=@output, spm_addr=a:16384, len0=64, n1=4, n2=1, dram_s1=64, dram_s2=256, spm_s1=64, spm_s2=256
+  MXU   TRACE   kind=end, tag=17, payload=0
+  VPU   TRACE   kind=marker, tag=42, payload=7
+  CTRL  HALT    exit_code=0

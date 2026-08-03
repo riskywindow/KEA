@@ -4,24 +4,29 @@
 // check the result. If a custom assembly format is wrong this is what catches
 // it.
 
-// CHECK-LABEL: func.func @matmul_buffers
-func.func @matmul_buffers(%a: !kea.buffer<8x16xi8, A>,
-                          %w: !kea.buffer<16x8xi8, W>,
-                          %acc: !kea.buffer<8x8xi32, ACC>) {
-  // CHECK: kea.matmul %{{.*}}, %{{.*}}, %{{.*}} : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
-  kea.matmul %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
+// NB: the buffer-level matrix multiply is `kea.mm`, not `kea.matmul`. The
+// de-risking spike called it `kea.matmul`, but ADR-0002 gives that name to the
+// Level 1 tensor op and names this one `kea.mm`; the definition is otherwise
+// unchanged and now lives in KeaMachineOps.td.
 
-  // CHECK: kea.matmul %{{.*}}, %{{.*}}, %{{.*}} {tile = #kea.tile_config<16, 16, 32>}
-  kea.matmul %a, %w, %acc {tile = #kea.tile_config<16, 16, 32>} : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
+// CHECK-LABEL: func.func @mm_buffers
+func.func @mm_buffers(%a: !kea.buffer<8x16xi8, A>,
+                      %w: !kea.buffer<16x8xi8, W>,
+                      %acc: !kea.buffer<8x8xi32, ACC>) {
+  // CHECK: kea.mm %{{.*}}, %{{.*}}, %{{.*}} : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
+  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
+
+  // CHECK: kea.mm %{{.*}}, %{{.*}}, %{{.*}} {tile = #kea.tile_config<16, 16, 32>}
+  kea.mm %a, %w, %acc {tile = #kea.tile_config<16, 16, 32>} : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
   return
 }
 
-// CHECK-LABEL: func.func @matmul_transposed
-func.func @matmul_transposed(%a: !kea.buffer<8x16xi8, A>,
-                             %w: !kea.buffer<8x16xi8, W>,
-                             %acc: !kea.buffer<8x8xi32, ACC>) {
-  // CHECK: kea.matmul %{{.*}}, %{{.*}}, %{{.*}} {transpose_rhs}
-  kea.matmul %a, %w, %acc {transpose_rhs} : !kea.buffer<8x16xi8, A>, !kea.buffer<8x16xi8, W>, !kea.buffer<8x8xi32, ACC>
+// CHECK-LABEL: func.func @mm_transposed
+func.func @mm_transposed(%a: !kea.buffer<8x16xi8, A>,
+                         %w: !kea.buffer<8x16xi8, W>,
+                         %acc: !kea.buffer<8x8xi32, ACC>) {
+  // CHECK: kea.mm %{{.*}}, %{{.*}}, %{{.*}} {transpose_rhs}
+  kea.mm %a, %w, %acc {transpose_rhs} : !kea.buffer<8x16xi8, A>, !kea.buffer<8x16xi8, W>, !kea.buffer<8x8xi32, ACC>
   return
 }
 
@@ -43,26 +48,29 @@ func.func @events() {
   return
 }
 
+// Level 1 conv2d: see l1-roundtrip.mlir for the full Level 1 op coverage.
 // CHECK-LABEL: func.func @conv
 func.func @conv(%in: tensor<1x8x8x4xi8>, %w: tensor<16x3x3x4xi8>, %b: tensor<16xi32>)
     -> tensor<1x8x8x16xi32> {
-  // CHECK: kea.conv2d %{{.*}}, %{{.*}}, %{{.*}} {pads = array<i64: 1, 1, 1, 1>, scale = 1.250000e-01 : f64, strides = array<i64: 1, 1>, zero_point = 7 : i32} : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>, tensor<16xi32>) -> tensor<1x8x8x16xi32>
-  %0 = kea.conv2d %in, %w, %b {strides = array<i64: 1, 1>,
-                               pads = array<i64: 1, 1, 1, 1>,
-                               scale = 0.125 : f64,
-                               zero_point = 7 : i32}
+  // CHECK: kea.conv2d %{{.*}}, %{{.*}} bias %{{.*}} {dilations = array<i64: 1, 1>, pads = array<i64: 1, 1, 1, 1>, strides = array<i64: 1, 1>, zero_points = #kea.zp<input = 7, weight = 0>} : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>, tensor<16xi32>) -> tensor<1x8x8x16xi32>
+  %0 = kea.conv2d %in, %w bias %b {zero_points = #kea.zp<input = 7, weight = 0>,
+                                    strides = array<i64: 1, 1>,
+                                    pads = array<i64: 1, 1, 1, 1>,
+                                    dilations = array<i64: 1, 1>}
       : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>, tensor<16xi32>) -> tensor<1x8x8x16xi32>
   return %0 : tensor<1x8x8x16xi32>
 }
 
 // CHECK-LABEL: func.func @conv_no_bias
 func.func @conv_no_bias(%in: tensor<1x8x8x4xi8>, %w: tensor<16x3x3x4xi8>)
-    -> tensor<1x8x8x16xi32> {
-  // Defaulted attributes (scale/zero_point) are elided on print.
-  // CHECK: kea.conv2d %{{.*}}, %{{.*}} {pads = array<i64: 0, 0, 0, 0>, strides = array<i64: 2, 2>} : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>) -> tensor<1x8x8x16xi32>
-  %0 = kea.conv2d %in, %w {strides = array<i64: 2, 2>, pads = array<i64: 0, 0, 0, 0>}
-      : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>) -> tensor<1x8x8x16xi32>
-  return %0 : tensor<1x8x8x16xi32>
+    -> tensor<1x4x4x16xi32> {
+  // CHECK: kea.conv2d %{{.*}}, %{{.*}} {dilations = array<i64: 1, 1>, pads = array<i64: 1, 1, 1, 1>, strides = array<i64: 2, 2>, zero_points = #kea.zp<input = 0, weight = 0>} : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>) -> tensor<1x4x4x16xi32>
+  %0 = kea.conv2d %in, %w {zero_points = #kea.zp<input = 0, weight = 0>,
+                           strides = array<i64: 2, 2>,
+                           pads = array<i64: 1, 1, 1, 1>,
+                           dilations = array<i64: 1, 1>}
+      : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>) -> tensor<1x4x4x16xi32>
+  return %0 : tensor<1x4x4x16xi32>
 }
 
 // Rank-0 and DRAM buffers, plus the attribute spelling of the address space.

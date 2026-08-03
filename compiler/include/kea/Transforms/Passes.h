@@ -3,6 +3,11 @@
 #define KEA_TRANSFORMS_PASSES_H
 
 #include "kea/Dialect/KeaDialect.h"
+// The generated pass bases name ::mlir::func::FuncOp and ::mlir::ModuleOp as
+// the anchor op types, and ::mlir::arith::ArithDialect as a dependent dialect,
+// so those declarations must be complete here.
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 
 #include <memory>

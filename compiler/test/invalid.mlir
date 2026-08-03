@@ -7,7 +7,9 @@
 func.func @bad_channels(%in: tensor<1x8x8x4xi8>, %w: tensor<16x3x3x8xi8>)
     -> tensor<1x8x8x16xi32> {
   // expected-error @+1 {{input channel count 4 does not match weight channel count 8}}
-  %0 = kea.conv2d %in, %w {strides = array<i64: 1, 1>, pads = array<i64: 0, 0, 0, 0>}
+  %0 = kea.conv2d %in, %w {zero_points = #kea.zp<input = 0, weight = 0>,
+                           strides = array<i64: 1, 1>, pads = array<i64: 1, 1, 1, 1>,
+                           dilations = array<i64: 1, 1>}
       : (tensor<1x8x8x4xi8>, tensor<16x3x3x8xi8>) -> tensor<1x8x8x16xi32>
   return %0 : tensor<1x8x8x16xi32>
 }
@@ -17,29 +19,31 @@ func.func @bad_channels(%in: tensor<1x8x8x4xi8>, %w: tensor<16x3x3x8xi8>)
 func.func @bad_strides(%in: tensor<1x8x8x4xi8>, %w: tensor<16x3x3x4xi8>)
     -> tensor<1x8x8x16xi32> {
   // expected-error @+1 {{expects exactly 2 strides}}
-  %0 = kea.conv2d %in, %w {strides = array<i64: 1, 1, 1>, pads = array<i64: 0, 0, 0, 0>}
+  %0 = kea.conv2d %in, %w {zero_points = #kea.zp<input = 0, weight = 0>,
+                           strides = array<i64: 1, 1, 1>, pads = array<i64: 1, 1, 1, 1>,
+                           dilations = array<i64: 1, 1>}
       : (tensor<1x8x8x4xi8>, tensor<16x3x3x4xi8>) -> tensor<1x8x8x16xi32>
   return %0 : tensor<1x8x8x16xi32>
 }
 
 // -----
 
-func.func @bad_matmul_k(%a: !kea.buffer<8x16xi8, A>,
-                        %w: !kea.buffer<32x8xi8, W>,
-                        %acc: !kea.buffer<8x8xi32, ACC>) {
+func.func @bad_mm_k(%a: !kea.buffer<8x16xi8, A>,
+                    %w: !kea.buffer<32x8xi8, W>,
+                    %acc: !kea.buffer<8x8xi32, ACC>) {
   // expected-error @+1 {{contraction dimension mismatch: lhs K=16 but rhs K=32}}
-  kea.matmul %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<32x8xi8, W>, !kea.buffer<8x8xi32, ACC>
+  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<32x8xi8, W>, !kea.buffer<8x8xi32, ACC>
   return
 }
 
 // -----
 
-func.func @matmul_wrong_space(%a: !kea.buffer<8x16xi8, A>,
-                              %w: !kea.buffer<16x8xi8, A>,
-                              %acc: !kea.buffer<8x8xi32, ACC>) {
+func.func @mm_wrong_space(%a: !kea.buffer<8x16xi8, A>,
+                          %w: !kea.buffer<16x8xi8, A>,
+                          %acc: !kea.buffer<8x8xi32, ACC>) {
   // The address space is enforced by the ODS type constraint, not the verifier.
   // expected-error @+1 {{operand #1 must be buffer in the weight scratchpad}}
-  kea.matmul %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, A>, !kea.buffer<8x8xi32, ACC>
+  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, A>, !kea.buffer<8x8xi32, ACC>
   return
 }
 

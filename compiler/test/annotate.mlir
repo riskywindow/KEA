@@ -8,7 +8,7 @@ func.func @body(%a: !kea.buffer<8x16xi8, A>,
                 %w: !kea.buffer<16x8xi8, W>,
                 %acc: !kea.buffer<8x8xi32, ACC>) {
   kea.signal 0
-  kea.matmul %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
+  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
   kea.wait 0
   return
 }

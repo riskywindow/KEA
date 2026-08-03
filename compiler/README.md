@@ -5,10 +5,13 @@
 that builds against the system LLVM/MLIR install and produces `kea-opt`, a
 `mlir-opt` clone that knows about `kea` in addition to every upstream dialect.
 
-Status: this is the de-risking spike. Everything here builds, runs and is
-tested; the ops are representative rather than complete. **It is the pattern
-the rest of the compiler copies**, so if you change a convention here, change
-it everywhere.
+Status: the **Level 1 (tensor level) half is implemented** -- ops, verifiers,
+`-tosa-to-kea`, `-linalg-to-kea` and `-kea-fuse`; see
+[docs/DIALECT_L1.md](../docs/DIALECT_L1.md). The Level 2 (buffer level) half is
+still the de-risking spike: `kea.dma_load` / `kea.mm` / `kea.signal` /
+`kea.wait` in `KeaMachineOps.td`, with the tiling / allocation / scheduling
+passes still to be written. **This directory is the pattern the rest of the
+compiler copies**, so if you change a convention here, change it everywhere.
 
 ---
 
@@ -78,16 +81,21 @@ compiler/
       KeaDialect.td                  Dialect def + Kea_Op/Kea_Type/Kea_Attr bases
       KeaAttrs.td                    AddressSpace enum, #kea.address_space, #kea.tile_config
       KeaTypes.td                    !kea.buffer + address-space type constraints
-      KeaOps.td                      the ops (TableGen entry point for add_mlir_dialect)
-      Kea{Dialect,Attrs,Types,Ops}.h thin headers wrapping the generated .inc files
+      KeaOps.td                      LEVEL 1 ops (TableGen entry point for add_mlir_dialect)
+      KeaMachineOps.td               LEVEL 2 ops -- its own -gen-op-{decls,defs} target
+      Kea{Dialect,Attrs,Types,Ops,MachineOps}.h  thin headers wrapping the .inc files
       CMakeLists.txt                 tablegen rules
+    Conversion/
+      Passes.td                      -tosa-to-kea / -linalg-to-kea declarations
+      Passes.h                       the populate*Patterns API
     Transforms/
-      Passes.td                      every pass is declared here
+      Passes.td                      every pass is declared or included here
       Passes.h                       GEN_PASS_DECL + GEN_PASS_REGISTRATION
       CMakeLists.txt
   lib/
-    Dialect/{KeaDialect,KeaAttrs,KeaTypes,KeaOps}.cpp
-    Transforms/{Annotate,CanonicalizeEvents}.cpp
+    Dialect/{KeaDialect,KeaAttrs,KeaTypes,KeaOps,KeaMachineOps}.cpp
+    Conversion/{TosaToKea,LinalgToKea,WeightLayout}.cpp
+    Transforms/{Annotate,CanonicalizeEvents,Fuse}.cpp
   tools/kea-opt/kea-opt.cpp          the driver
   test/                              .mlir tests + run_tests.sh
 ```
@@ -102,13 +110,22 @@ path.
 | thing | spelling |
 |---|---|
 | type | `!kea.buffer<8x16xi8, A>`, `!kea.buffer<f32, DRAM>` |
-| enum attr | `#kea.address_space<ACC>` |
+| enum attr | `#kea.address_space<ACC>`, `#kea.pool_kind<AVG>` |
 | attr | `#kea.tile_config<16, 16, 32>` |
-| op (tensor) | `kea.conv2d %in, %w[, %bias] {strides, pads, scale, zero_point}` |
-| op (buffer) | `kea.dma_load %src to %dst : memref<…> to !kea.buffer<…>` |
-| op (buffer) | `kea.matmul %a, %w, %acc` |
-| op (sync) | `kea.signal 3` / `kea.wait 3` |
-| pass | `-kea-annotate[=marker=npu]`, `-kea-canonicalize-events` |
+| attr (L1 quant) | `#kea.zp<input = -5, weight = 0>` |
+| attr (L1 quant) | `#kea.quant<multiplier = [1073741824], shift = [30], input_zp = 0, output_zp = -5, axis = -1, rounding = DOUBLE>` |
+| attr (L1 quant) | `#kea.epilogue<requant = <…>, clamp = [-128, 127], accum = <…>, residual = <…>, output = <…>>` |
+| op (L1 tensor) | `kea.conv2d`, `kea.dwconv2d`, `kea.matmul`, `kea.fully_connected`, `kea.add`, `kea.pool`, `kea.rescale`, `kea.clamp`, `kea.reshape`, `kea.transpose` |
+| op (L2 buffer) | `kea.dma_load %src to %dst : memref<…> to !kea.buffer<…>` |
+| op (L2 buffer) | `kea.mm %a, %w, %acc` |
+| op (L2 sync) | `kea.signal 3` / `kea.wait 3` |
+| pass (L1 in) | `-tosa-to-kea`, `-linalg-to-kea` |
+| pass (L1 → L1) | `-kea-fuse[=report-stats=true]` |
+| pass (misc) | `-kea-annotate[=marker=npu]`, `-kea-canonicalize-events` |
+
+**NB: the buffer-level matrix multiply is `kea.mm`, not `kea.matmul`.** The
+spike called it `kea.matmul`; ADR-0002 gives that name to the Level 1 tensor op
+and names the Level 2 one `kea.mm`. The definition is otherwise unchanged.
 
 Address spaces: `A` (activation scratchpad), `W` (weight scratchpad), `ACC`
 (accumulator bank, 32-bit only), `DRAM` (off chip).
@@ -337,7 +354,28 @@ the standard `configure_lit_site_cfg()` + `add_lit_testsuite()` pair and set
     "unknown type in dialect kea".
 
 19. **`expected-error {{...}}` in `-verify-diagnostics` is a literal substring
-    match, not a regex.** Paste the exact diagnostic text.
+    match, not a regex.** Paste the exact diagnostic text. Note also that an
+    `AttrDef` verifier (`genVerifyDecl`) fires at *parse* time and its
+    diagnostic is located at the **attribute**, not at the op, so the
+    `expected-error` comment must sit above the attribute's line.
+
+19a. **A comma-led optional operand group commits on the comma.**
+    `(`,` `bias` $bias^)? (`,` `residual` $residual^)?` cannot parse
+    `%in, %w, residual %r` -- it sees the comma, enters the bias group and
+    fails with `expected 'bias'`. Key optional groups on their keyword instead:
+    `(`bias` $bias^)? (`residual` $residual^)?`, giving `%in, %w bias %b
+    residual %r`.
+
+19b. **An attribute cannot directly follow an SSA operand in an assembly
+    format.** MLIR lexes `%b #kea.zp<…>` as "result `#…` of value `%b`" and
+    reports `invalid SSA value result number`. Put the attribute in
+    `attr-dict`, or separate it with a keyword literal.
+
+19c. **`SameOperandsAndResultType` lives in
+    `mlir/Interfaces/InferTypeOpInterface.td`, not `OpBase.td`**, and ODS
+    silently adds `InferTypeOpInterface::Trait` to any op that uses it -- so
+    the corresponding `.h` include becomes mandatory (see gotcha 8 for the
+    identical failure mode).
 
 ### Upstream dialect versions
 
@@ -347,6 +385,17 @@ the standard `configure_lit_site_cfg()` + `add_lit_testsuite()` pair and set
     attribute to `values`. When we upgrade LLVM,
     `test/upstream-dialects.mlir` is the first thing that will break — that is
     intentional, it is the canary.
+
+21a. **Pass `Statistic`s are compiled out by this LLVM install.** The bottle is
+    Release with `NDEBUG` and without `LLVM_FORCE_ENABLE_STATS`, so
+    `llvm::Statistic` is `NoopStatistic` and `-mlir-pass-statistics` prints an
+    empty report -- for upstream passes too (verify with
+    `mlir-opt --symbol-dce -mlir-pass-statistics`). It cannot be fixed from out
+    of tree, because the printer lives in the prebuilt `libMLIRPass` and
+    forcing the macro on locally would change `Pass::Statistic`'s layout
+    relative to it. `-kea-fuse` therefore keeps plain counters and publishes
+    them with `-kea-fuse=report-stats=true` in addition to declaring the
+    `Statistic`s.
 
 21. **`--tosa-to-linalg-named` is an `OperationPass<func::FuncOp>`** and cannot be
     given directly on the command line at module scope:

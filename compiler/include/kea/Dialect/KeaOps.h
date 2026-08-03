@@ -14,6 +14,12 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
+// ODS silently adds InferTypeOpInterface::Trait to any op carrying
+// SameOperandsAndResultType (kea.clamp), so this include is mandatory even
+// though no op mentions the interface. Symptom of omitting it: "no member
+// named 'InferTypeOpInterface' in namespace 'mlir'" followed by a wall of
+// bogus "use of undeclared identifier 'getOperation'".
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 // ConditionallySpeculatable / MemoryEffectOpInterface, pulled in by `Pure` and
 // by the Arg<..., [MemRead]> effect annotations.
 #include "mlir/Interfaces/SideEffectInterfaces.h"

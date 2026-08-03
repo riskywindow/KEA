@@ -5,6 +5,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "kea/Dialect/KeaDialect.h"
+#include "kea/Dialect/KeaMachineOps.h"
 #include "kea/Dialect/KeaOps.h"
 #include "kea/Transforms/Passes.h"
 

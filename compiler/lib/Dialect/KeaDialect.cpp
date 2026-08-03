@@ -2,6 +2,7 @@
 
 #include "kea/Dialect/KeaDialect.h"
 #include "kea/Dialect/KeaAttrs.h"
+#include "kea/Dialect/KeaMachineOps.h"
 #include "kea/Dialect/KeaOps.h"
 #include "kea/Dialect/KeaTypes.h"
 
@@ -16,8 +17,14 @@ using namespace mlir::kea;
 void KeaDialect::initialize() {
   registerTypes();
   registerAttributes();
+  // Level 1 (tensor level), from KeaOps.td.
   addOperations<
 #define GET_OP_LIST
 #include "kea/Dialect/KeaOps.cpp.inc"
+      >();
+  // Level 2 (buffer level), from KeaMachineOps.td.
+  addOperations<
+#define GET_OP_LIST
+#include "kea/Dialect/KeaMachineOps.cpp.inc"
       >();
 }

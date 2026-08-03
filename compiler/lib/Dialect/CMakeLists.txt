@@ -4,6 +4,7 @@
 add_mlir_dialect_library(MLIRKeaDialect
   KeaAttrs.cpp
   KeaDialect.cpp
+  KeaMachineOps.cpp
   KeaOps.cpp
   KeaTypes.cpp
 
@@ -12,10 +13,12 @@ add_mlir_dialect_library(MLIRKeaDialect
 
   DEPENDS
   MLIRKeaOpsIncGen
+  MLIRKeaMachineOpsIncGen
   MLIRKeaAttrsIncGen
 
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRSupport
+  MLIRInferTypeOpInterface
   MLIRSideEffectInterfaces
 )

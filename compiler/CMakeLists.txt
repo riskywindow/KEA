@@ -69,8 +69,11 @@ add_definitions(${LLVM_DEFINITIONS})
 enable_testing()
 
 add_subdirectory(include/kea/Dialect)
+# NB: include/kea/Conversion holds only Passes.td (which Transforms/Passes.td
+# `include`s) and Passes.h, so it has no CMakeLists of its own.
 add_subdirectory(include/kea/Transforms)
 add_subdirectory(lib/Dialect)
+add_subdirectory(lib/Conversion)
 add_subdirectory(lib/Transforms)
 add_subdirectory(tools/kea-opt)
 add_subdirectory(test)

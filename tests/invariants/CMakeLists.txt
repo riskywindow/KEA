@@ -1,0 +1,3 @@
+add_executable(test_requant_equivalence test_requant_equivalence.cpp)
+target_link_libraries(test_requant_equivalence PRIVATE kea_isa)
+add_test(NAME invariants.requant_equivalence COMMAND test_requant_equivalence)

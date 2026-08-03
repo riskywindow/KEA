@@ -195,7 +195,6 @@ struct Node {
   int origIndex = 0; ///< position in -kea-tile's sequential program
   int queue = -1;    ///< QMXU..QDMA1; chosen during scheduling for DMA
   bool dma = false;  ///< queue is not fixed by the opcode
-  int region = -1;   ///< index into Sched::regions, -1 outside any
   int64_t occ = 0;   ///< resource occupancy, cycles
   int64_t bytes = 0; ///< DRAM bytes (DMA only)
   SmallVector<int, 4> preds;
@@ -269,8 +268,7 @@ struct Sched {
 
   int64_t nSignals = 0, nWaits = 0, nHoisted = 0;
 
-  std::array<int64_t, 3> budget = {}; ///< capacity the guard may commit
-  std::array<int, 3> window = {};     ///< buffers of a space that may be live
+  std::array<int, 3> window = {}; ///< buffers of a space that may be live
   int capacityIters = 0;
 
   LogicalResult run(bool reportSchedule);
@@ -346,7 +344,6 @@ void Sched::collect() {
     n.dma = n.queue < 0;
     n.occ = occupancyOf(&op);
     n.bytes = dmaBytesOf(&op);
-    n.region = regionStack.empty() ? -1 : regionStack.back();
     nodes.push_back(n);
   }
 
@@ -587,7 +584,8 @@ void Sched::listSchedule() {
       }
       bool fits = true;
       for (int s = 0; s < 3; ++s)
-        if (delta[s] && spaceUse[s] + delta[s] > budget[s])
+        if (delta[s] &&
+            spaceUse[s] + delta[s] > spaceCapacity((AddressSpace)s))
           fits = false;
 
       SmallVector<int, 2> qs;
@@ -855,10 +853,8 @@ void Sched::assignSync() {
 void Sched::locateRegions() {
   // A region's queue is the one that does its arithmetic, so errata E4's "the
   // region keeps accumulating until the issuing unit's pipeline drains"
-  // attributes the tail of a layer to that layer. Both markers go on the same
-  // queue; because per-queue order is preserved and region membership is
-  // contiguous in -kea-tile's order, a region's instructions on that queue are
-  // contiguous in it, so regions on one queue can never interleave.
+  // attributes the tail of a layer to that layer rather than to its successor.
+  // Both markers go on that one queue.
   for (Region &r : regions) {
     if (!r.begin || !r.end || r.lastOrig < r.firstOrig)
       continue;
@@ -1184,8 +1180,6 @@ LogicalResult Sched::run(bool reportSchedule) {
   // fit at once, computed from the real extents; if the *extended* ranges still
   // do not fit, K comes down and the schedule is recomputed. K = 1 is the floor
   // and always fits: no two buffers of a space are ever live together.
-  for (int s = 0; s < 3; ++s)
-    budget[s] = spaceCapacity((AddressSpace)s);
   const SmallVector<Node> baseGraph = nodes;
 
   std::array<SmallVector<int>, 3> perSpace; ///< buffer indices, original order

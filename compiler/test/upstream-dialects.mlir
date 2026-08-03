@@ -41,11 +41,14 @@ func.func @linalg_matmul(%a: tensor<8x16xf32>, %b: tensor<16x8xf32>,
 // A mixed module: tosa/linalg and kea coexisting is what the lowering passes
 // will produce mid-pipeline.
 // CHECK-LABEL: func.func @mixed
-func.func @mixed(%src: memref<8x16xi8>, %dst: !kea.buffer<8x16xi8, A>,
+func.func @mixed(%src: !kea.buffer<128xi8, DRAM>, %dst: !kea.buffer<144xi8, A>,
                  %a: tensor<8x16xf32>, %b: tensor<16x8xf32>, %c: tensor<8x8xf32>)
     -> tensor<8x8xf32> {
   // CHECK: kea.dma_load
-  kea.dma_load %src to %dst : memref<8x16xi8> to !kea.buffer<8x16xi8, A>
+  kea.dma_load %src -> %dst {dram_addr = 0, spm_addr = 0, len0 = 16, n1 = 8,
+                             n2 = 1, dram_s1 = 16, dram_s2 = 0, spm_s1 = 16,
+                             spm_s2 = 0}
+    : !kea.buffer<128xi8, DRAM> -> !kea.buffer<144xi8, A>
   // CHECK: linalg.matmul
   %0 = linalg.matmul ins(%a, %b : tensor<8x16xf32>, tensor<16x8xf32>)
                      outs(%c : tensor<8x8xf32>) -> tensor<8x8xf32>

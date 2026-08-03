@@ -1,5 +1,7 @@
 // RUN: kea-opt %s -tosa-to-kea -kea-fuse | FileCheck %s
 // RUN: kea-opt %s -tosa-to-kea -kea-fuse=report-stats=true | FileCheck %s --check-prefix=STATS
+// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile=report-tiles=true | FileCheck %s --check-prefix=TILEFIT
+// RUN: kea-opt %s -tosa-to-kea -kea-fuse -kea-tile | kea-opt | FileCheck %s --check-prefix=L2
 //
 // END-TO-END INTEGRATION TEST: a complete MobileNetV2 inverted-residual block
 // in quantized TOSA, all the way to fully-fused KEA Level 1.
@@ -86,6 +88,102 @@
 
 // STATS-LABEL: func.func @mobilenet_v2_inverted_residual_stride2
 // STATS-SAME: kea.fusion_stats = {bias = 0 : i64, clamp = 2 : i64, quant_add = 0 : i64, requant = 3 : i64, rescale_composed = 0 : i64, rescale_refused = 0 : i64, rescale_removed = 0 : i64, residual = 0 : i64, shape_folded = 0 : i64}
+
+
+//===--------------------------------------------------------------------===//
+// ...and all the way down to Level 2 machine ops.
+//
+// -kea-tile turns the three fused Level 1 ops into a straight-line KEA-1
+// instruction stream on symbolic buffers: a MATMUL chain for the expand conv,
+// a DWCONV for the depthwise, a MATMUL chain plus VADD for the projection and
+// its residual. The second RUN line pipes the result back through kea-opt, so
+// everything below is verified L2 that parses, verifies and round-trips.
+//===--------------------------------------------------------------------===//
+
+// The function is now a machine program: it returns nothing and ends in HALT.
+// L2-LABEL: func.func @mobilenet_v2_inverted_residual
+// L2-SAME:  (%{{[^:]*}}: tensor<1x8x8x4xi8>)
+// L2-NOT:   -> tensor
+
+// Not one Level 1 op survives. (The `= ` anchors these to an SSA definition;
+// the tiling report names the ops it costed, which is not the same thing.)
+// L2-NOT: = kea.conv2d
+// L2-NOT: = kea.dwconv2d
+// L2-NOT: = kea.rescale
+// L2-NOT: = kea.clamp
+// L2-NOT: = kea.add
+
+// The block input is a DRAM symbol; so is every inter-layer feature map.
+// L2: kea.alloc {name = "mobilenet_v2_inverted_residual.input0", role = "input"} : !kea.buffer<256xi8, DRAM>
+
+// 1. Expand 4 -> 24. Two output-channel groups, so two ACC regions of
+//    8*8*16 = 1024 words and two VQUANTs. IC = 4 means k_rows = 4 and the
+//    other 12 reduction lanes are the zeros LOAD_W installs.
+// L2: kea.trace "begin" 0
+// L2: kea.load_w %{{.*}} {bank = 0 : i64, k_rows = 4 : i64, n_cols = 16 : i64
+// L2: kea.mm %{{.*}} {a_addr = 0 : i64, a_inner_stride = 4 : i64, a_outer_stride = 32 : i64, acc_addr = 0 : i64, acc_inner_stride = 16 : i64, acc_outer_stride = 128 : i64, bank = 0 : i64, m_inner = 8 : i64, m_outer = 8 : i64}
+// L2: kea.vquant %{{.*}} {acc_addr = 0 : i64, {{.*}}out_pix_stride = 32 : i64, out_zp = -128 : i64
+//    The 24-channel tail group: n_cols = 8, and its ACC region starts at 1024.
+//    NOTE THE BANK. This group is one LOAD_W/MATMUL pair, as is the group
+//    before it, so restarting the tap counter per output-channel group (the
+//    literal reading of ISA.md §8.3) would put BOTH loads in bank 0 and
+//    serialise this one behind the previous MATMUL. The counter is monotonic
+//    over the whole MXU stream instead, so it lands in the idle bank.
+// L2: kea.load_w %{{.*}} {bank = 1 : i64, k_rows = 4 : i64, n_cols = 8 : i64
+// L2: kea.mm %{{.*}} {a_addr = 0 : i64, {{.*}}acc_addr = 1024 : i64, {{.*}}bank = 1 : i64
+// L2: kea.dma_store
+// L2: kea.trace "end" 0
+
+// 2. Depthwise 3x3 s1 pad 1 on 24 channels. DWCONV needs a multiple of 16, so
+//    the tile is padded to 32 channels and the extra 8 weight lanes are zero.
+//    The halo (and the padded lanes) get the input zero point, -128.
+// L2: kea.trace "begin" 1
+// L2: kea.vcopy to %{{.*}}fill, fill_value = -128 : i64
+// L2: kea.dwconv %{{.*}} {a_addr = 0 : i64, a_pix_stride = 32 : i64, a_row_stride = 320 : i64, acc_addr = 0 : i64, channels = 32 : i64, kernel = 3 : i64, out_h = 8 : i64, out_w = 8 : i64, stride = 1 : i64, w_addr = 0 : i64}
+// L2: kea.vquant %{{.*}} {acc_addr = 0 : i64, acc_pix_stride = 32 : i64, channels = 32 : i64
+// L2: kea.trace "end" 1
+
+// 3. Project 24 -> 4 plus the inverted-residual add. Two reduction tiles
+//    (k_rows 16 then 8), then VQUANT, then VADD against the block input.
+//    The derived KeaAddParam is on the addparam allocation, in isa.h field
+//    order, and satisfies errata E6.
+// L2: kea.alloc {add_param = array<i64: 1610612736, 1073741824, 1503238553, 1, 0, 8, -5, -5, -5>, layout = "add_params"
+// L2: kea.trace "begin" 2
+// L2: kea.load_w %{{.*}} {bank = 0 : i64, k_rows = 16 : i64, n_cols = 4 : i64, w_addr = 0 : i64
+// L2: kea.mm %{{.*}} {a_addr = 0 : i64, a_inner_stride = 24 : i64, a_outer_stride = 192 : i64, acc_addr = 0 : i64, {{.*}}bank = 0 : i64
+// L2: kea.load_w %{{.*}} {bank = 1 : i64, k_rows = 8 : i64, n_cols = 4 : i64, w_addr = 256 : i64
+// L2: kea.mm %{{.*}} {a_addr = 16 : i64, {{.*}}accumulate, bank = 1 : i64
+// L2: kea.vquant
+// L2: kea.vadd %{{.*}} {a_addr = 0 : i64, b_addr = 0 : i64, clamp_hi = 127 : i64, clamp_lo = -128 : i64, num_elems = 1024 : i64
+// L2: kea.dma_store %{{.*}} : !kea.buffer<1040xi8, A> -> !kea.buffer<256xi8, DRAM>
+// L2: kea.trace "end" 2
+// L2: kea.halt
+
+// -kea-tile assigns NO addresses, NO queues and NO semaphores: that is
+// -kea-alloc's and -kea-schedule's work.
+// L2-NOT: kea.signal
+// L2-NOT: kea.wait
+
+//===--------------------------------------------------------------------===//
+// Every chosen tile fits the real scratchpad: SPM_A and SPM_W are 256 KiB
+// (KEA_SPM_A_BYTES / KEA_SPM_W_BYTES) and -kea-tile spends at most half of
+// each so -kea-schedule can double buffer; ACC is 32768 int32 words.
+//===--------------------------------------------------------------------===//
+
+// TILEFIT-LABEL: func.func @mobilenet_v2_inverted_residual
+// TILEFIT-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2336 : i64, spm_w = 896 : i64, taps = 16 : i64},
+// TILEFIT-SAME: {acc = 2048 : i64, channels = 32 : i64, layer = 1 : i64, oh = 8 : i64, op = "kea.dwconv2d", ow = 8 : i64, spm_a = 5280 : i64, spm_w = 672 : i64, taps = 9 : i64},
+// TILEFIT-SAME: {acc = 1024 : i64, cycles = {{[0-9]+}} : i64, layer = 2 : i64, oc_groups = 1 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2592 : i64, spm_w = 704 : i64, taps = 32 : i64}]
+
+// TILEFIT-LABEL: func.func @mobilenet_v2_inverted_residual_stride2
+// TILEFIT-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2336 : i64, spm_w = 896 : i64, taps = 16 : i64},
+// TILEFIT-SAME: {acc = 512 : i64, channels = 32 : i64, layer = 1 : i64, oh = 4 : i64, op = "kea.dwconv2d", ow = 4 : i64, spm_a = 3136 : i64, spm_w = 672 : i64, taps = 9 : i64},
+// TILEFIT-SAME: {acc = 256 : i64, cycles = {{[0-9]+}} : i64, layer = 2 : i64, oc_groups = 1 : i64, oh = 4 : i64, op = "kea.conv2d", ow = 4 : i64, spm_a = 672 : i64, spm_w = 704 : i64, taps = 32 : i64}]
+
+// The stride-2 depthwise: 8x8 -> 4x4 with pad [0,1,0,1].
+// L2-LABEL: func.func @mobilenet_v2_inverted_residual_stride2
+// L2: kea.dwconv %{{.*}}stride = 2 : i64
+// L2: kea.halt
 
 func.func @mobilenet_v2_inverted_residual(%x: tensor<1x8x8x4xi8>) -> tensor<1x8x8x4xi8> {
 

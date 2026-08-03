@@ -56,6 +56,14 @@ include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
+# The FROZEN machine contract: include/kea/{isa.h,hw_config.h} at the repo root.
+# Header-only C++17 constexpr, so this links nothing and does not violate
+# ADR-0001's "the MLIR half never links native code" -- but it is what stops the
+# Level 2 verifiers and the -kea-tile cost model from hardcoding scratchpad
+# sizes, alignments and timing formulas that would then drift from the
+# assembler and the simulator. There is no header-name collision: this tree
+# provides kea/{isa,hw_config}.h and the one above provides kea/Dialect/*.h.
+include_directories(${PROJECT_SOURCE_DIR}/../include)
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
 add_definitions(${LLVM_DEFINITIONS})
 

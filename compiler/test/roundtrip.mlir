@@ -4,38 +4,31 @@
 // check the result. If a custom assembly format is wrong this is what catches
 // it.
 
-// NB: the buffer-level matrix multiply is `kea.mm`, not `kea.matmul`. The
-// de-risking spike called it `kea.matmul`, but ADR-0002 gives that name to the
-// Level 1 tensor op and names this one `kea.mm`; the definition is otherwise
-// unchanged and now lives in KeaMachineOps.td.
+// NB: the buffer-level ops moved on since the de-risking spike. `kea.mm` is
+// now the KEA-1 `MATMUL` instruction exactly -- no weight operand (the weights
+// are whatever the last `kea.load_w` put in `bank`), and every field named
+// after its `KeaMatmul` counterpart in include/kea/isa.h. The full Level 2 op
+// set round-trips in l2-roundtrip.mlir; this file keeps one of each so the
+// canonical smoke test still covers both levels.
 
 // CHECK-LABEL: func.func @mm_buffers
-func.func @mm_buffers(%a: !kea.buffer<8x16xi8, A>,
-                      %w: !kea.buffer<16x8xi8, W>,
-                      %acc: !kea.buffer<8x8xi32, ACC>) {
-  // CHECK: kea.mm %{{.*}}, %{{.*}}, %{{.*}} : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
-  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
-
-  // CHECK: kea.mm %{{.*}}, %{{.*}}, %{{.*}} {tile = #kea.tile_config<16, 16, 32>}
-  kea.mm %a, %w, %acc {tile = #kea.tile_config<16, 16, 32>} : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, W>, !kea.buffer<8x8xi32, ACC>
-  return
-}
-
-// CHECK-LABEL: func.func @mm_transposed
-func.func @mm_transposed(%a: !kea.buffer<8x16xi8, A>,
-                         %w: !kea.buffer<8x16xi8, W>,
-                         %acc: !kea.buffer<8x8xi32, ACC>) {
-  // CHECK: kea.mm %{{.*}}, %{{.*}}, %{{.*}} {transpose_rhs}
-  kea.mm %a, %w, %acc {transpose_rhs} : !kea.buffer<8x16xi8, A>, !kea.buffer<8x16xi8, W>, !kea.buffer<8x8xi32, ACC>
+func.func @mm_buffers(%a: !kea.buffer<1616xi8, A>,
+                      %acc: !kea.buffer<2048xi32, ACC>) {
+  // CHECK: kea.mm %{{.*}}, %{{.*}} {a_addr = 0 : i64, {{.*}}} : !kea.buffer<1616xi8, A>, !kea.buffer<2048xi32, ACC>
+  kea.mm %a, %acc {a_addr = 0, a_inner_stride = 16, a_outer_stride = 160,
+                   m_inner = 8, m_outer = 8, acc_addr = 0,
+                   acc_inner_stride = 16, acc_outer_stride = 128, bank = 0}
+    : !kea.buffer<1616xi8, A>, !kea.buffer<2048xi32, ACC>
   return
 }
 
 // CHECK-LABEL: func.func @dma
-func.func @dma(%src: memref<8x16xi8>, %dst: !kea.buffer<8x16xi8, A>) {
-  // CHECK: kea.dma_load %{{.*}} to %{{.*}} {event = 3 : i64} : memref<8x16xi8> to !kea.buffer<8x16xi8, A>
-  kea.dma_load %src to %dst {event = 3 : i64} : memref<8x16xi8> to !kea.buffer<8x16xi8, A>
-  // CHECK: kea.dma_load %{{.*}} to %{{.*}} : memref<8x16xi8> to !kea.buffer<8x16xi8, A>
-  kea.dma_load %src to %dst : memref<8x16xi8> to !kea.buffer<8x16xi8, A>
+func.func @dma(%src: !kea.buffer<1024xi8, DRAM>, %dst: !kea.buffer<1616xi8, A>) {
+  // CHECK: kea.dma_load %{{.*}} -> %{{.*}} {dram_addr = 0 : i64, {{.*}}} : !kea.buffer<1024xi8, DRAM> -> !kea.buffer<1616xi8, A>
+  kea.dma_load %src -> %dst {dram_addr = 0, spm_addr = 176, len0 = 128, n1 = 8,
+                             n2 = 1, dram_s1 = 128, dram_s2 = 0, spm_s1 = 160,
+                             spm_s2 = 0}
+    : !kea.buffer<1024xi8, DRAM> -> !kea.buffer<1616xi8, A>
   return
 }
 

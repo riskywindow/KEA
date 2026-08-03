@@ -1,7 +1,9 @@
 add_mlir_library(MLIRKeaTransforms
+  Alloc.cpp
   Annotate.cpp
   CanonicalizeEvents.cpp
   Fuse.cpp
+  Tile.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/kea/Transforms

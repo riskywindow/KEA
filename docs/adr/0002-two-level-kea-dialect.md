@@ -48,9 +48,37 @@ KEA instruction — this level is the ISA in SSA clothing.
 | `-tosa-to-kea` / `-linalg-to-kea` | tosa / linalg | L1 |
 | `-kea-fuse` | L1 | L1 (fewer ops, fatter epilogues) |
 | `-kea-tile` | L1 | L2 (tiled to scratchpad capacity, symbolic buffers) |
-| `-kea-alloc` | L2 | L2 (symbolic buffers → absolute addresses) |
 | `-kea-schedule` | L2 | L2 (queues assigned, semaphores inserted, DMA double-buffered) |
+| `-kea-alloc` | L2 | L2 (symbolic buffers → absolute addresses) |
 | `-kea-emit` (kea-translate) | L2 | `.kasm` + weights + map (see ADR-0001) |
+
+### Amendment (2026-08-01): scheduling runs *before* allocation
+
+The table originally had `-kea-alloc` before `-kea-schedule`. That is wrong, and
+the reason is worth recording because it is the nicest property in the backend.
+
+`-kea-tile` emits a fresh `kea.alloc` per spatial tile, so consecutive tiles have
+**disjoint** live ranges. An allocator run at that point would correctly conclude
+they can share storage and give them the same address — at which point double
+buffering is impossible, because prefetching tile *N+1* would overwrite tile *N*.
+
+Run the scheduler first and the problem dissolves. Hoisting a DMA so it overlaps
+the previous tile's compute *extends that buffer's live range* until it overlaps
+its predecessor's. The allocator then sees overlapping ranges and separates them
+for the ordinary reason. So:
+
+> **Double buffering is expressed entirely as a live-range extension. The
+> allocator needs no knowledge of it, and no concept of "double buffering"
+> appears anywhere in `-kea-alloc`.**
+
+`-kea-tile` reserves half of each scratchpad (`spm-reserve-factor`, default 2) so
+the space for the second set of tiles is guaranteed to exist.
+
+The cost is that `-kea-alloc` must tolerate `kea.signal`/`kea.wait` in its input
+and must recompute live ranges rather than trusting the `live` attribute stamped
+by `-kea-tile` — the scheduler moves ops, which shifts the block indices those
+ranges are expressed in. `mlir::kea::refreshLiveRanges()` exists for exactly
+this, and any pass that inserts, erases, or moves an L2 op must call it.
 
 ## Consequences
 

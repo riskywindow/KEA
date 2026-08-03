@@ -28,30 +28,17 @@ func.func @bad_strides(%in: tensor<1x8x8x4xi8>, %w: tensor<16x3x3x4xi8>)
 
 // -----
 
-func.func @bad_mm_k(%a: !kea.buffer<8x16xi8, A>,
-                    %w: !kea.buffer<32x8xi8, W>,
-                    %acc: !kea.buffer<8x8xi32, ACC>) {
-  // expected-error @+1 {{contraction dimension mismatch: lhs K=16 but rhs K=32}}
-  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<32x8xi8, W>, !kea.buffer<8x8xi32, ACC>
-  return
-}
-
-// -----
-
-func.func @mm_wrong_space(%a: !kea.buffer<8x16xi8, A>,
-                          %w: !kea.buffer<16x8xi8, A>,
-                          %acc: !kea.buffer<8x8xi32, ACC>) {
-  // The address space is enforced by the ODS type constraint, not the verifier.
-  // expected-error @+1 {{operand #1 must be buffer in the weight scratchpad}}
-  kea.mm %a, %w, %acc : !kea.buffer<8x16xi8, A>, !kea.buffer<16x8xi8, A>, !kea.buffer<8x8xi32, ACC>
-  return
-}
-
-// -----
-
-func.func @dma_to_dram(%src: memref<8x16xi8>, %dst: !kea.buffer<8x16xi8, DRAM>) {
-  // expected-error @+1 {{destination must be an on-chip buffer}}
-  kea.dma_load %src to %dst : memref<8x16xi8> to !kea.buffer<8x16xi8, DRAM>
+// The Level 2 verifiers get a file of their own (l2-invalid.mlir), which walks
+// every ISA.md §11.1 alignment rule. One case here keeps this file covering
+// both levels.
+func.func @mm_acc_misaligned(%a: !kea.buffer<1616xi8, A>,
+                             %acc: !kea.buffer<2048xi32, ACC>) {
+  // ACC is addressed in int32 WORDS and every address is a multiple of 16.
+  // expected-error @+1 {{acc_addr (8) must be a multiple of 16 words}}
+  kea.mm %a, %acc {a_addr = 0, a_inner_stride = 16, a_outer_stride = 160,
+                   m_inner = 8, m_outer = 8, acc_addr = 8,
+                   acc_inner_stride = 16, acc_outer_stride = 128, bank = 0}
+    : !kea.buffer<1616xi8, A>, !kea.buffer<2048xi32, ACC>
   return
 }
 

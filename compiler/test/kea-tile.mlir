@@ -160,12 +160,16 @@ func.func @dwconv_s2(%in: tensor<1x8x8x32xi8>, %w: tensor<32x3x3x1xi8>)
 
 // CHECK-LABEL: func.func @too_big_for_spm
 // TILES-LABEL: func.func @too_big_for_spm
-// The tile is a 16-row band of the full 112-wide image. Both scratchpad
-// footprints stay under half of their 262144-byte capacity (the reserve that
-// lets -kea-schedule double buffer), and the ACC tile stays under 32768 words.
-// TILES-SAME: acc = 28672 : i64
-// TILES-SAME: oh = 16 : i64, op = "kea.conv2d", ow = 112 : i64
-// TILES-SAME: spm_a = 86048 : i64, spm_w = 704 : i64
+// The tile is an 8-row band of the full 112-wide image. Every on-chip
+// footprint stays under half of its capacity -- SPM_A and SPM_W under half of
+// 262144 bytes, ACC under half of 32768 words -- which is the reserve that lets
+// -kea-schedule put a second tile in flight. ACC is held to the same reserve as
+// the scratchpads deliberately: a tile sized to fill ACC cannot be overlapped
+// with its successor, which is precisely the overlap the cost model assumes
+// when it prices max(MXU,VPU,DMA) rather than the sum.
+// TILES-SAME: acc = 14336 : i64
+// TILES-SAME: oh = 8 : i64, op = "kea.conv2d", ow = 112 : i64
+// TILES-SAME: spm_a = 43040 : i64, spm_w = 704 : i64
 func.func @too_big_for_spm(%in: tensor<1x112x112x32xi8>, %w: tensor<16x1x1x32xi8>)
     -> tensor<1x112x112x16xi8> {
   %0 = kea.conv2d %in, %w {zero_points = #kea.zp<input = 0, weight = 0>,

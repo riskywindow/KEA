@@ -33,6 +33,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "kea/hw_config.h"
@@ -300,6 +301,12 @@ std::optional<ConvTiling> chooseConvTiling(const ConvShape &s,
                                            int64_t spmReserve) {
   const int64_t spmABudget = kSpmABytes / spmReserve;
   const int64_t spmWBudget = kSpmWBytes / spmReserve;
+  // ACC is on-chip memory and needs double-buffering headroom for exactly the
+  // same reason SPM_A and SPM_W do. Letting one tile take all 32768 words
+  // contradicts the cost model below, which prices max(MXU,VPU,DMA) -- an
+  // overlap a full-ACC tile makes impossible. Measured as ~10.6k cycles of MXU
+  // semaphore stall on a conv tile loop before this was applied.
+  const int64_t accBudget = kAccWords / spmReserve;
 
   std::optional<ConvTiling> best;
   for (int64_t ohT : divisorsOf(s.OH)) {
@@ -321,7 +328,7 @@ std::optional<ConvTiling> chooseConvTiling(const ConvShape &s,
 
       for (int64_t ocgT = s.ocGroups(); ocgT >= 1; --ocgT) {
         const int64_t accWords = ocgT * ohT * owT * kMxuN;
-        if (accWords > kAccWords)
+        if (accWords > accBudget)
           continue;
         const int64_t outBytes = ohT * owT * ocgT * kMxuN + kActTailPad;
         if (inBytes + outBytes > spmABudget)
@@ -464,6 +471,8 @@ private:
   OpBuilder b;
   int64_t spmReserve;
   int64_t layerId = 0;
+  /// Occurrence count per requested scratch name, for uniquification.
+  llvm::StringMap<unsigned> scratchNameCount;
   DenseMap<Value, Value> dramFor; // Level 1 tensor -> DRAM !kea.buffer
 
   /// Count of LOAD_W/MATMUL pairs emitted so far, monotonic over the whole
@@ -506,8 +515,20 @@ private:
     return op.getResult();
   }
 
+  /// A scratchpad buffer. The name is uniquified, because `layerName()` is
+  /// per-layer while these are created per *tile*: a layer with four spatial
+  /// tiles asks for "f.3.atile" four times and would otherwise emit four
+  /// buffers sharing one name. DIALECT_L2.md §4.1 requires names to be unique
+  /// in the module, and `kea-translate` rejects a duplicate outright, so
+  /// without this no genuinely tiled layer can reach `.kasm`.
+  ///
+  /// The suffix is only appended from the second occurrence, so an untiled
+  /// layer's names -- and every test pinning them -- are unchanged.
   Value scratch(Location loc, int64_t extent, AddressSpace as, StringRef name) {
-    return makeBuffer(loc, extent, as, name, "scratch");
+    unsigned n = scratchNameCount[name]++;
+    std::string unique =
+        n == 0 ? name.str() : (name + Twine('#') + Twine(n)).str();
+    return makeBuffer(loc, extent, as, unique, "scratch");
   }
 
   /// The DRAM buffer backing a Level 1 tensor value, created on demand.
@@ -739,7 +760,8 @@ LogicalResult Tiler::lowerContraction(Operation *op, ConvShape s,
            << "no output tile fits the scratchpad: even a 1x1 output tile of "
            << s.OC << " channels needs more than SPM_A/" << spmReserve << " ("
            << (kSpmABytes / spmReserve) << " B) or SPM_W/" << spmReserve
-           << " or ACC (" << kAccWords << " words)";
+           << " or ACC/" << spmReserve << " (" << (kAccWords / spmReserve)
+           << " words)";
   const ConvTiling t = *tOpt;
 
   // Level 2 buffers for the layer's DRAM-resident operands.
@@ -1059,7 +1081,7 @@ LogicalResult Tiler::lowerDwconv(DWConv2DOp op) {
       const int64_t inBytes = ihP * iwP * cPad + kDwuLanes;
       const int64_t outBytes = ohT * owT * cPad + kDwuLanes;
       const int64_t accWords = ohT * owT * cPad;
-      if (accWords > kAccWords || inBytes + outBytes > spmABudget)
+      if (accWords > kAccWords / spmReserve || inBytes + outBytes > spmABudget)
         continue;
       if (iwP * cPad > kDmaMaxLen0 || ihP > kDmaMaxN1)
         continue;

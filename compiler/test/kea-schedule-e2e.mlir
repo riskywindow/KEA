@@ -19,9 +19,8 @@
 //   2. re-running `-kea-alloc` in verify-only mode re-proves from scratch that
 //      no two overlapping-live-range buffers share storage;
 //   3. the schedule report: both DMA engines carry work, the depth-16 queues
-//      are respected, the whole block needs 15 of the 32 events, and the
-//      modelled cost of overlapping (2098) beats the modelled cost of not
-//      (2522), which is why `mode=auto` emits the overlapped plan;
+//      are respected, and the modelled cost of overlapping beats the modelled
+//      cost of not, which is why `mode=auto` emits the overlapped plan;
 //   4. running `-kea-tile` over already-Level-2 IR re-runs `verifyWeightBanks`
 //      and `refreshLiveRanges` (DIALECT_L2.md §2), so errata E7 and the
 //      live-range stamps are re-checked after all the motion.
@@ -56,23 +55,30 @@
 // REVERIFY: addr =
 
 // REPORT-LABEL: func.func @mobilenet_v2_inverted_residual(
+// Deliberately NO exact cycle or event counts here. Everything downstream of
+// `-kea-tile` moves when the tiler's cost model changes, and pinning those
+// numbers in a *scheduler* test only produces false failures owned by someone
+// else. What is asserted is what this pass is responsible for.
+//
 // One pass of the capacity fixpoint: the buffers-in-flight bound each space
 // started from was admissible first time.
 // REPORT-SAME:  capacity_iters = 1 : i64
-// REPORT-SAME:  events = 15 : i64
-// The two plans are costed with the same model and the overlapped one wins,
-// so that is what is emitted (SCHEDULING.md §9).
+// Both plans are costed with the same model and the overlapped one wins, so
+// that is what is emitted (SCHEDULING.md §9). `modelled_in_order` is the model
+// of what the backend emits with no scheduler at all.
 // REPORT-SAME:  mode = "overlap"
-// REPORT-SAME:  modelled_in_order = 2522 : i64
-// REPORT-SAME:  modelled_overlap = 2098 : i64
+// REPORT-SAME:  modelled_in_order = {{[0-9]+}} : i64
+// REPORT-SAME:  modelled_overlap = {{[0-9]+}} : i64
+// The depth-16 queues are modelled.
 // REPORT-SAME:  queue_depth = 16 : i64
 // Both engines carry real DRAM traffic, and neither queue reaches its depth.
 // REPORT-SAME:  DMA0 = {busy = {{[1-9][0-9]*}} : i64, dram_bytes = {{[1-9][0-9]*}} : i64
 // REPORT-SAME:  DMA1 = {busy = {{[1-9][0-9]*}} : i64, dram_bytes = {{[1-9][0-9]*}} : i64
-// The whole block needs well under either scratchpad even with the widened
-// ranges: 11248 of 262144 bytes of SPM_A.
-// REPORT-SAME:  spm_a_peak = 11248 : i64
-// REPORT-SAME:  spm_w_peak = 2292 : i64
+// A layer may run one region ahead of the oldest one still in flight, and the
+// widened ranges still leave both scratchpads mostly empty.
+// REPORT-SAME:  region_lookahead = 1 : i64
+// REPORT-SAME:  spm_a_peak = {{[0-9]+}} : i64
+// REPORT-SAME:  spm_w_peak = {{[0-9]+}} : i64
 
 // REVALIDATE-LABEL: func.func @mobilenet_v2_inverted_residual(
 // REVALIDATE: kea.load_w

@@ -176,8 +176,12 @@ def KeaTile : Pass<"kea-tile", "::mlir::func::FuncOp"> {
     // each layer's tile greedily. This is the whole-function budget the
     // planner spends; leave headroom for the SIGNAL/WAIT pairs -kea-schedule
     // and kea-translate add afterwards (measured at 44-61% of the tiled
-    // program on MobileNetV2 -- see docs/DIALECT_L2.md §5.5).
-    Option<"imemBudget", "imem-budget", "int64_t", /*default=*/"20480",
+    // program on MobileNetV2). The default is a MEASURED value, not a modelled
+    // one: 20200 is the point on MobileNetV2's instructions/cycles curve that
+    // minimises simulated cycles, and it also happens to minimise DRAM traffic
+    // and program size. The cost model cannot predict it -- see
+    // docs/DIALECT_L2.md §5.5 for the curve and for why.
+    Option<"imemBudget", "imem-budget", "int64_t", /*default=*/"20200",
            "Whole-function KEA-1 instruction budget the tiler plans against">,
     Option<"reportTiles", "report-tiles", "bool", /*default=*/"false",
            "Attach the chosen tile shapes and their scratchpad footprints to "
@@ -258,6 +262,21 @@ def KeaSchedule : Pass<"kea-schedule", "::mlir::func::FuncOp"> {
            /*default=*/"6",
            "Percent of each scratchpad to leave unclaimed as headroom for "
            "-kea-alloc's greedy packer; 0 to use all of it">,
+    // How many `kea.trace` regions -- layers, in practice -- the scheduler may
+    // run ahead of the oldest one still in flight. 1 is "prefetch the next
+    // layer", which is where the win is; without a bound a 20-byte addparams
+    // DMA that depends on nothing gets issued 30,000 instructions early, which
+    // buys nothing, holds a buffer live for the whole program, and drags the
+    // layer's TRACE marker with it. 0 disables cross-layer overlap entirely.
+    // How much better the reordered plan has to look, in percent, before
+    // `mode=auto` reorders at all. Both plans come from the same cost model so
+    // a difference is meaningful, but a 1% predicted win is inside its error.
+    Option<"declineMargin", "decline-margin", "int64_t", /*default=*/"5",
+           "Percent by which the overlapped plan must beat the in-order plan "
+           "before mode=auto reorders">,
+    Option<"regionLookahead", "region-lookahead", "int64_t", /*default=*/"1",
+           "How many kea.trace regions the scheduler may run ahead of the "
+           "oldest one still in flight">,
     Option<"annotateUnits", "annotate-units", "bool", /*default=*/"true",
            "Stamp the derived queue on fixed-unit ops as `kea.unit`">,
     // Statistics are inert on this LLVM install (Release+NDEBUG =>

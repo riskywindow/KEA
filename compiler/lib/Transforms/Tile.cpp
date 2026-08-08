@@ -28,6 +28,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -251,6 +252,11 @@ struct ConvTiling {
   int64_t ihP = 0, iwP = 0;   // padded input tile extent
   int64_t inBytes = 0, outBytes = 0, wBytes = 0, qpBytes = 0, accWords = 0;
   uint64_t cycles = 0;
+  /// Total DRAM bytes the layer moves under this tiling. Coarsening a tile
+  /// changes this -- more oc tiles re-read the whole input once each, and a
+  /// smaller spatial tile re-reads more halo -- which is why it is part of the
+  /// cost rather than a side effect.
+  int64_t dramBytes = 0;
   /// True when two of these tiles fit in every scratchpad they touch, i.e.
   /// when `-kea-schedule` can prefetch the next tile under this one's compute.
   bool doubleBufferable = false;
@@ -313,11 +319,60 @@ struct TileCost {
   /// wrong way round.
   uint64_t sync = 0;
 
-  uint64_t bound(bool doubleBufferable) const {
-    return sync + (doubleBufferable ? std::max(mxu, std::max(vpu, dma))
-                                    : mxu + vpu + dma);
+  /// On-chip cycles for one tile. DMA is deliberately NOT here -- see
+  /// `layerCycles()`.
+  uint64_t compute(bool doubleBufferable) const {
+    return sync + (doubleBufferable ? std::max(mxu, vpu) : mxu + vpu);
   }
 };
+
+/// Cycles for a whole layer: the roofline, not a sum of per-tile maxima.
+///
+/// WHY DRAM IS COSTED PER LAYER AND NOT PER TILE
+/// ---------------------------------------------
+/// Taking `max(MXU, VPU, DMA)` per tile makes extra DRAM traffic *completely
+/// free* on any tile whose compute already dominates -- so the search would
+/// happily buy instruction budget with bandwidth it cannot see it is spending.
+/// It did: coarsening MobileNetV2's feature extractor to fit IMEM raised
+/// measured DRAM traffic 22.9% and pushed the whole network from compute bound
+/// to memory bound (27.7 ops/byte against a 32.0 ridge, MICROARCH.md §9.2).
+///
+/// But the DRAM port is one shared 16 B/cycle resource for the entire program
+/// (`KEA_DRAM_BYTES_PER_CYCLE`, "SHARED by both engines"), so it is a global
+/// budget, not a per-tile one. Costing a layer as `max(total compute, total
+/// DMA)` is exactly MICROARCH.md §9.2's roofline, and it has the property the
+/// per-tile form lacks: a layer already past the ridge point pays for *every*
+/// extra byte, so it resists coarsening hard, while a compute-bound layer with
+/// bandwidth to spare coarsens freely until it reaches the ridge. That is the
+/// distinction the tiler needs and could not previously make.
+/// `perTileDma` is the pipeline-fill term: a double-buffered tile loop is
+/// `fill + N*max(compute, dma)`, and the fill is one tile's DMA that has
+/// nothing to hide under. It is what stops the search from coarsening without
+/// limit once IMEM is scarce -- with two enormous tiles there is nothing left
+/// to overlap, and the measured signature of that is MXU semaphore stall,
+/// which rises from 1.33M to 2.10M cycles across the bottom of the
+/// instructions/cycles curve while the DRAM port stays flat at ~42% duty
+/// (docs/DIALECT_L2.md §5.5).
+inline uint64_t layerCycles(uint64_t computeCycles, uint64_t dmaCycles,
+                            uint64_t perTileDma, uint64_t numTiles,
+                            bool doubleBufferable) {
+  if (!doubleBufferable)
+    return computeCycles + dmaCycles;
+  // Software-pipeline form: within a tile LOOP the first tile's DMA has
+  // nothing to hide under, so it is exposed and everything after it overlaps
+  // with compute. That fill term is what stops the search coarsening without
+  // limit once IMEM is scarce -- with two enormous tiles there is nothing left
+  // to overlap, and the measured signature is MXU semaphore stall rising from
+  // 1.33M to 2.10M cycles across the bottom of the instructions/cycles curve
+  // while the DRAM port stays flat at ~42% duty (docs/DIALECT_L2.md §5.5).
+  //
+  // A layer with ONE tile has no loop and no fill: whether its DMA overlaps
+  // anything depends on the neighbouring layers, which a per-layer model
+  // cannot see. `max()` there is the same optimistic cross-layer assumption
+  // the rest of this model makes, not an oversight.
+  uint64_t fill = numTiles > 1 ? std::min(perTileDma, dmaCycles) : 0;
+  return fill + std::max(computeCycles, dmaCycles - fill);
+}
 
 /// The unavoidable per-tile drain: the producing unit's pipeline has to empty
 /// before the consumer's `WAIT` can be released.
@@ -500,9 +555,6 @@ Candidates enumerateConvTilings(const ConvShape &s, int64_t spmReserve,
 
         const int64_t nSpatial = (s.OH / ohT) * (s.OW / owT);
         const int64_t nOcTiles = ceilDiv(s.ocGroups(), ocgT);
-        const uint64_t weightDma =
-            ::kea::keaDmaOccupancy(static_cast<uint32_t>(wBytes), 1, 1) +
-            ::kea::keaDmaOccupancy(static_cast<uint32_t>(qpBytes), 1, 1);
         // Can `-kea-schedule` keep two of these live at once? That decides
         // whether the tile's DMA hides under its compute. With
         // `spm-reserve-factor >= 2` every candidate that got this far already
@@ -511,13 +563,38 @@ Candidates enumerateConvTilings(const ConvShape &s, int64_t spmReserve,
         t.doubleBufferable =
             2 * (inBytes + outBytes) <= kSpmABytes &&
             2 * accWords <= kAccWords && 2 * (wBytes + qpBytes) <= kSpmWBytes;
-        t.cycles = static_cast<uint64_t>(nOcTiles) *
-                   (weightDma +
-                    static_cast<uint64_t>(nSpatial) * s.batch *
-                        costConvTile(s, t).bound(t.doubleBufferable));
+
+        const TileCost tc = costConvTile(s, t);
+        const uint64_t tiles =
+            static_cast<uint64_t>(nOcTiles) * nSpatial * s.batch;
+
+        // --- DRAM traffic, in bytes and in port cycles ---------------------
+        // Weights and KeaQuantParams: each output-channel group's tile is
+        // fetched exactly once however the layer is split, because the spatial
+        // loop sits inside the output-channel loop.
+        const int64_t wTraffic =
+            s.ocGroups() * (wPerGroup + kMxuN * kQuantParamBytes) * s.batch;
+        // Activations in: the whole padded window, once per spatial tile AND
+        // once per output-channel tile. This is the term the tiling moves --
+        // halving `OCG_t` doubles the number of times the entire input is
+        // re-read, and shrinking the spatial tile re-reads more halo.
+        const int64_t inTraffic =
+            static_cast<int64_t>(tiles) * ihP * iwP * s.IC;
+        // Activations out, and the residual in: one pass each over the output.
+        const int64_t outTraffic = s.OH * s.OW * s.OC * s.batch;
+        t.dramBytes =
+            wTraffic + inTraffic + outTraffic + (residual ? outTraffic : 0);
+
+        const uint64_t dmaCycles =
+            static_cast<uint64_t>(nOcTiles) *
+                (::kea::keaDmaOccupancy(static_cast<uint32_t>(wBytes), 1, 1) +
+                 ::kea::keaDmaOccupancy(static_cast<uint32_t>(qpBytes), 1, 1)) +
+            tiles * tc.dma;
+
+        t.cycles = layerCycles(tiles * tc.compute(t.doubleBufferable),
+                               dmaCycles, tc.dma, tiles, t.doubleBufferable);
         t.instrs = instrsForConvTiling(s, t, residual);
         out.push_back(t);
-        (void)0;
       }
     }
   }
@@ -588,9 +665,15 @@ Candidates enumerateDwTilings(const DwShape &d, int64_t spmReserve) {
       tc.dma = ::kea::keaDmaOccupancy(iwP * d.C, ihP, 1) +
                ::kea::keaDmaOccupancy(d.C, owT, ohT);
       tc.sync = kDwuTileSync;
-      uint64_t cyc = tc.bound(dbuf);
       ConvTiling t;
       t.doubleBufferable = dbuf;
+      // A depthwise re-reads its halo once per spatial tile; there is no
+      // channel loop, so that is the only term the tiling moves.
+      t.dramBytes = static_cast<int64_t>(nSpatial) * ihP * iwP * d.cPad +
+                    d.OH * d.OW * d.C + d.KH * d.KH * d.cPad;
+      const uint64_t cyc = layerCycles(
+          static_cast<uint64_t>(nSpatial) * tc.compute(dbuf),
+          static_cast<uint64_t>(nSpatial) * tc.dma, tc.dma, nSpatial, dbuf);
       t.ohT = ohT;
       t.owT = owT;
       t.ocgT = 1;
@@ -599,7 +682,7 @@ Candidates enumerateDwTilings(const DwShape &d, int64_t spmReserve) {
       t.inBytes = inBytes;
       t.outBytes = outBytes;
       t.accWords = accWords;
-      t.cycles = cyc * static_cast<uint64_t>(nSpatial);
+      t.cycles = cyc;
       // TRACE begin/end, the weight and KeaQuantParam DMAs, then per spatial
       // tile: the halo fill, the activation load, the DWCONV, the VQUANT and
       // the output store.
@@ -702,6 +785,7 @@ public:
   double budgetPrice = 0.0;
   int64_t plannedInstrs = 0, cheapestInstrs = 0;
   uint64_t plannedCycles = 0, fastestCycles = 0;
+  int64_t plannedDram = 0, unconstrainedDram = 0;
   SmallVector<Attribute> tileReport;
 
 private:
@@ -769,8 +853,14 @@ private:
   Value makeBuffer(Location loc, int64_t extent, AddressSpace as,
                    StringRef nameIn, StringRef role, ValueRange source = {}) {
     unsigned n = bufferNameCount[nameIn]++;
+    // A DRAM buffer's name is also its `.kasm` symbol, and ASSEMBLY.md §4
+    // spells those `@[A-Za-z0-9_./]+` -- no '#'. Emitting one makes the
+    // assembler stop parsing mid-symbol and report the REST of the line as
+    // missing operands, which points nowhere near the cause. On-chip buffers
+    // are never symbols, so they keep the more visually distinct '#'.
+    const char sep = (as == AddressSpace::DRAM) ? '.' : '#';
     std::string uniqueName =
-        n == 0 ? nameIn.str() : (nameIn + Twine('#') + Twine(n)).str();
+        n == 0 ? nameIn.str() : (nameIn + Twine(sep) + Twine(n)).str();
     StringRef name(uniqueName);
     Type elem = (as == AddressSpace::ACC) ? b.getIntegerType(32)
                                           : b.getIntegerType(8);
@@ -780,6 +870,24 @@ private:
     op->setAttr("role", b.getStringAttr(role));
     return op.getResult();
   }
+
+  /// A 16x16 int8 identity, as an OHWI weight tensor. Cached per function: one
+  /// `arith.constant` serves every rescale, and -kea-emit lays it out through
+  /// the ordinary `mxu_tiles_16x16` path into a single 256-byte tile.
+  Value identityWeights(Operation *at) {
+    if (identityConst)
+      return identityConst;
+    OpBuilder::InsertionGuard g(b);
+    b.setInsertionPointToStart(&func.front());
+    SmallVector<int8_t> v(kMxuK * kMxuN, 0);
+    for (int64_t i = 0; i < kMxuK; ++i)
+      v[i * kMxuN + i] = 1;
+    auto ty = RankedTensorType::get({kMxuN, 1, 1, kMxuK}, b.getIntegerType(8));
+    identityConst = b.create<arith::ConstantOp>(
+        at->getLoc(), ty, DenseElementsAttr::get(ty, ArrayRef<int8_t>(v)));
+    return identityConst;
+  }
+  Value identityConst;
 
   Value scratch(Location loc, int64_t extent, AddressSpace as, StringRef name) {
     return makeBuffer(loc, extent, as, name, "scratch");
@@ -828,6 +936,7 @@ private:
   LogicalResult lowerDwconv(DWConv2DOp op);
   LogicalResult lowerPool(PoolOp op);
   LogicalResult lowerAdd(AddOp op);
+  LogicalResult lowerRescale(RescaleOp op);
 
   //--- constraint discharge ------------------------------------------------
   LogicalResult checkAccumulatorBound(Operation *op, int64_t reductionTaps,
@@ -904,13 +1013,16 @@ LogicalResult Tiler::solveTilingBudget(ArrayRef<Operation *> l1) {
 
   // The frontier is sorted by ascending instructions, so front() is the
   // smallest program and back() is the fastest.
+  int64_t dramAt = 0;
   auto totalAt = [&](double lambda, int64_t &instrs, uint64_t &cycles) {
     instrs = 0;
     cycles = 0;
+    dramAt = 0;
     for (const Candidates *c : sets) {
       const ConvTiling &t = pickUnderPrice(*c, lambda);
       instrs += t.instrs;
       cycles += t.cycles;
+      dramAt += t.dramBytes;
     }
   };
 
@@ -925,6 +1037,7 @@ LogicalResult Tiler::solveTilingBudget(ArrayRef<Operation *> l1) {
 
   double lambda = 0.0;
   totalAt(0.0, plannedInstrs, plannedCycles);
+  unconstrainedDram = dramAt;
 
   if (plannedInstrs > imemBudget) {
     if (smallest > imemBudget)
@@ -965,6 +1078,7 @@ LogicalResult Tiler::solveTilingBudget(ArrayRef<Operation *> l1) {
     lambda = hi;
     totalAt(lambda, plannedInstrs, plannedCycles);
   }
+  plannedDram = dramAt;
 
   budgetPrice = lambda;
   for (Operation *op : l1) {
@@ -1405,6 +1519,8 @@ LogicalResult Tiler::lowerContraction(Operation *op, ConvShape s,
       b.getNamedAttr("acc", b.getI64IntegerAttr(t.accWords)),
       b.getNamedAttr("taps", b.getI64IntegerAttr(s.reductionTaps())),
       b.getNamedAttr("cycles", b.getI64IntegerAttr((int64_t)t.cycles)),
+      b.getNamedAttr("instrs", b.getI64IntegerAttr(t.instrs)),
+      b.getNamedAttr("dram", b.getI64IntegerAttr(t.dramBytes)),
   }));
   return success();
 }
@@ -1569,6 +1685,8 @@ LogicalResult Tiler::lowerDwconv(DWConv2DOp op) {
                                          cPad * kQuantParamBytes)),
       b.getNamedAttr("acc", b.getI64IntegerAttr(bestAcc)),
       b.getNamedAttr("taps", b.getI64IntegerAttr(KH * KW)),
+      b.getNamedAttr("instrs", b.getI64IntegerAttr(dt.instrs)),
+      b.getNamedAttr("dram", b.getI64IntegerAttr(dt.dramBytes)),
   }));
   return success();
 }
@@ -1728,6 +1846,179 @@ LogicalResult Tiler::lowerAdd(AddOp op) {
       b.getNamedAttr("op", b.getStringAttr("kea.add")),
       b.getNamedAttr("elems", b.getI64IntegerAttr(chunk)),
       b.getNamedAttr("spm_a", b.getI64IntegerAttr(3 * chunk)),
+  }));
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Standalone rescale -- an identity MATMUL into ACC, then VQUANT
+//===----------------------------------------------------------------------===//
+//
+// `VQUANT` is exactly a rescale, but it can only read ACC (isa.h `KeaVquant`:
+// `acc_addr` is an ACC word index), and ACC is writable only by the MXU and
+// the DWU -- ISA.md §10.4 says so outright: "ACC is not reachable from VCOPY;
+// initialize accumulators with MATMUL/DWCONV accumulate=0 instead." So a
+// tensor sitting in SPM_A cannot be requantized in place.
+//
+// The way in is to multiply it by the identity. `LOAD_W` a 16x16 identity tile
+// and `MATMUL` streams a 16-channel slice of SPM_A into ACC unchanged
+// (`acc[n] = sum_k A[k] * I[k][n] = A[n]`), where `VQUANT` can reach it. The
+// zero-point fold that -kea-emit already performs for every contraction,
+// `bias[c] = bias_l1[c] - input_zp * sum_k w[c][k]`, becomes exactly
+// `-input_zp` because the identity's row sum is 1 -- which is precisely what a
+// rescale needs. So this reuses the existing `quant_params` path with no new
+// contract on the emitter at all.
+//
+// The cost is honest and worth stating: the MXU runs at 1/16 utilization,
+// because 15 of its 16 reduction lanes are multiplying by zero. That is fine
+// for MobileNetV2's head, which rescales a single 1280-channel pixel, and it
+// would be a poor way to rescale a large feature map. The cheaper alternative
+// -- `VADD` against a zero operand, which is a pure VPU pass -- is NOT used
+// because `keaQuantizedAdd` applies TWO multiply-shift roundings where TOSA
+// applies one, and ADR-0003's equivalence result covers `keaRequantize`, not
+// that composition. The demo compares bit-exactly against the golden
+// reference, so an extra ulp is a failure, not a rounding detail.
+LogicalResult Tiler::lowerRescale(RescaleOp op) {
+  Location loc = op.getLoc();
+  auto inTy = llvm::cast<RankedTensorType>(op.getInput().getType());
+  auto outTy = llvm::cast<RankedTensorType>(op.getOutput().getType());
+  if (!inTy.getElementType().isInteger(8) || !outTy.getElementType().isInteger(8))
+    return op.emitOpError(
+        "only an int8 -> int8 rescale is lowered. An i32 operand is an "
+        "accumulator that never left ACC, and there is no way to put one back "
+        "there: DMA cannot reach ACC and neither can VCOPY (ISA.md §10.4). "
+        "Fuse it into the op that produced it instead.");
+
+  QuantAttr q = op.getQuant();
+  const int64_t rank = inTy.getRank();
+  const int64_t C = rank == 0 ? 1 : inTy.getShape()[rank - 1];
+  const int64_t pixels = inTy.getNumElements() / C;
+  const int64_t cPad = roundUp(C, kVpuLanes);
+  const int64_t groups = ceilDiv(C, kMxuN);
+  if (q.isPerChannel() && q.getAxis() != rank - 1)
+    return op.emitOpError("a per-channel rescale must be indexed by the "
+                          "innermost dimension to match the NHWC layout");
+
+  // The identity's row sum is 1, so the accumulator this requantizes is just
+  // the int8 input recentred: |acc + bias| <= 255. ADR-0003 is discharged the
+  // same way as for any contraction.
+  Value ident = identityWeights(op);
+  if (failed(checkAccumulatorBound(op, /*taps=*/1, ident, /*bias=*/Value(),
+                                   /*ocLast=*/false, kMxuN, q.getInputZp(), q)))
+    return failure();
+
+  // Tile over pixels. ACC holds one 16-channel group at a time, so a group's
+  // VQUANT can run while the next group's MATMUL is still streaming.
+  const int64_t spmABudget = kSpmABytes / spmReserve;
+  const int64_t accBudget = kAccWords / spmReserve;
+  int64_t pixT = std::min<int64_t>(pixels, kMaxRows);
+  pixT = std::min(pixT, accBudget / kMxuN);
+  while (pixT > 1 && (pixT * C + kActTailPad + pixT * cPad > spmABudget ||
+                      pixT * C > kDmaMaxLen0 || pixT * cPad > kDmaMaxLen0))
+    pixT /= 2;
+  if (pixT < 1 || pixT * C + kActTailPad + pixT * cPad > spmABudget)
+    return op.emitOpError()
+           << "a single pixel of " << C << " channels does not fit SPM_A/"
+           << spmReserve;
+
+  Value inBuf = dram(op.getInput(), "activation", layerName("in"));
+  Value outBuf = dram(op.getOutput(), "activation", layerName("out"));
+  Value wBuf = makeBuffer(loc, kMxuTileBytes, AddressSpace::DRAM,
+                          layerName("identity"), "weights", ValueRange{ident});
+  wBuf.getDefiningOp<AllocOp>()->setAttr("layout",
+                                         b.getStringAttr("mxu_tiles_16x16"));
+
+  // One KeaQuantParam block per output-channel group. A per-tensor rescale
+  // needs only one, shared by every group; a per-channel one is sliced,
+  // because the emitter sizes the block by the weight tensor's output channels
+  // and the identity has 16 of them.
+  SmallVector<Value> qpBufs;
+  for (int64_t g = 0; g < groups; ++g) {
+    QuantAttr gq = q;
+    if (q.isPerChannel()) {
+      ArrayRef<int32_t> m = q.getMultiplier().asArrayRef();
+      ArrayRef<int8_t> sh = q.getShift().asArrayRef();
+      SmallVector<int32_t> ms;
+      SmallVector<int8_t> ss;
+      for (int64_t c = g * kMxuN; c < (g + 1) * kMxuN; ++c) {
+        int64_t i = std::min<int64_t>(c, (int64_t)m.size() - 1);
+        ms.push_back(m[i]);
+        ss.push_back(sh[i]);
+      }
+      gq = QuantAttr::get(op.getContext(), b.getDenseI32ArrayAttr(ms),
+                          b.getDenseI8ArrayAttr(ss), q.getInputZp(),
+                          q.getOutputZp(), /*axis=*/0, q.getRounding());
+    }
+    Value qp = makeBuffer(loc, kMxuN * kQuantParamBytes, AddressSpace::DRAM,
+                          layerName("qparams"), "qparam", ValueRange{ident});
+    auto a = qp.getDefiningOp<AllocOp>();
+    a->setAttr("layout", b.getStringAttr("quant_params"));
+    a->setAttr("quant", gq);
+    a->setAttr("input_zp", b.getI64IntegerAttr(q.getInputZp()));
+    qpBufs.push_back(qp);
+  }
+
+  b.create<TraceOp>(loc, b.getStringAttr("begin"), layerId, 0, StringAttr());
+
+  Value wTile = scratch(loc, kMxuTileBytes, AddressSpace::W, layerName("wtile"));
+  b.create<DmaLoadOp>(loc, wBuf, wTile, 0, 0, kMxuTileBytes, 1, 1,
+                      kMxuTileBytes, 0, kMxuTileBytes, 0, StringAttr());
+  const int64_t qpBytes = kMxuN * kQuantParamBytes;
+  Value qpTile = scratch(loc, groups * qpBytes, AddressSpace::W,
+                         layerName("qptile"));
+  for (int64_t g = 0; g < groups; ++g)
+    b.create<DmaLoadOp>(loc, qpBufs[g], qpTile, 0, g * qpBytes, qpBytes, 1, 1,
+                        qpBytes, 0, qpBytes, 0, StringAttr());
+
+  for (int64_t p0 = 0; p0 < pixels; p0 += pixT) {
+    const int64_t n = std::min(pixT, pixels - p0);
+    ++numTiles;
+    Value aTile = scratch(loc, n * C + kActTailPad, AddressSpace::A,
+                          layerName("atile"));
+    // The last group reads 16 bytes from a pixel that may hold fewer, so the
+    // tail is defined the same way every activation tile's is (§6.4).
+    emitFill(loc, aTile, n * C + kActTailPad, q.getInputZp());
+    b.create<DmaLoadOp>(loc, inBuf, aTile, p0 * C, 0, n * C, 1, 1, n * C, 0,
+                        n * C, 0, StringAttr());
+    Value oTile =
+        scratch(loc, n * cPad, AddressSpace::A, layerName("otile"));
+    Value accTile =
+        scratch(loc, n * kMxuN, AddressSpace::ACC, layerName("acc"));
+
+    for (int64_t g = 0; g < groups; ++g) {
+      const int64_t lanes = std::min<int64_t>(kMxuN, C - g * kMxuN);
+      b.create<LoadWOp>(loc, wTile, /*w_addr=*/0, /*w_row_stride=*/kMxuN,
+                        /*k_rows=*/lanes, /*n_cols=*/lanes,
+                        /*bank=*/mxuPairs++ & 1, /*int4=*/false);
+      b.create<MmOp>(loc, aTile, accTile, /*a_addr=*/g * kMxuN,
+                     /*a_inner_stride=*/C, /*a_outer_stride=*/C,
+                     /*m_inner=*/n, /*m_outer=*/1, /*acc_addr=*/0,
+                     /*acc_inner_stride=*/kMxuN, /*acc_outer_stride=*/kMxuN,
+                     /*bank=*/(mxuPairs - 1) & 1, /*accumulate=*/false,
+                     /*int4=*/false);
+      ++numMatmuls;
+      b.create<VquantOp>(loc, accTile, oTile, qpTile, /*acc_addr=*/0,
+                         /*out_addr=*/g * kMxuN,
+                         /*qparam_addr=*/g * qpBytes, /*num_pixels=*/n,
+                         /*channels=*/kMxuN, /*acc_pix_stride=*/kMxuN,
+                         /*out_pix_stride=*/cPad,
+                         /*out_zp=*/q.getOutputZp(), /*clamp_lo=*/-128,
+                         /*clamp_hi=*/127, /*int4=*/false);
+    }
+    b.create<DmaStoreOp>(loc, oTile, outBuf, /*dram_addr=*/p0 * C,
+                         /*spm_addr=*/0, /*len0=*/C, /*n1=*/n, /*n2=*/1,
+                         /*dram_s1=*/C, /*dram_s2=*/0, /*spm_s1=*/cPad,
+                         /*spm_s2=*/0, StringAttr());
+  }
+
+  b.create<TraceOp>(loc, b.getStringAttr("end"), layerId, 0, StringAttr());
+  tileReport.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("layer", b.getI64IntegerAttr(layerId)),
+      b.getNamedAttr("op", b.getStringAttr("kea.rescale")),
+      b.getNamedAttr("pixels", b.getI64IntegerAttr(pixT)),
+      b.getNamedAttr("channels", b.getI64IntegerAttr(C)),
+      b.getNamedAttr("spm_a", b.getI64IntegerAttr(pixT * C + pixT * cPad)),
+      b.getNamedAttr("acc", b.getI64IntegerAttr(pixT * kMxuN)),
   }));
   return success();
 }
@@ -1924,6 +2215,8 @@ LogicalResult Tiler::lower(Operation *op) {
     return lowerPool(p);
   if (auto ad = dyn_cast<AddOp>(op))
     return lowerAdd(ad);
+  if (auto rs = dyn_cast<RescaleOp>(op))
+    return lowerRescale(rs);
 
   if (auto rs = dyn_cast<ReshapeOp>(op)) {
     // A Level 1 reshape is a row-major reinterpretation of the same bytes, so
@@ -1935,10 +2228,11 @@ LogicalResult Tiler::lower(Operation *op) {
 
   return op->emitOpError(
       "has no Level 2 lowering. -kea-tile lowers kea.conv2d, kea.dwconv2d, "
-      "kea.matmul, kea.fully_connected, kea.pool, quantized kea.add and "
-      "kea.reshape; kea.rescale, kea.clamp and kea.transpose must be "
-      "eliminated by -kea-fuse (KEA-1 has no transpose unit and no way to "
-      "rescale a tensor that never entered ACC).");
+      "kea.matmul, kea.fully_connected, kea.pool, kea.rescale, quantized "
+      "kea.add and kea.reshape; kea.clamp and kea.transpose must be "
+      "eliminated by -kea-fuse, because KEA-1 has no transpose unit (ISA.md "
+      "§13) and a clamp with no requantization to ride along with is not an "
+      "instruction.");
 }
 
 //===----------------------------------------------------------------------===//
@@ -2117,6 +2411,9 @@ struct KeaTilePass : public mlir::kea::impl::KeaTileBase<KeaTilePass> {
               b.getNamedAttr(
                   "cycles_unconstrained",
                   b.getI64IntegerAttr((int64_t)tiler.fastestCycles)),
+              b.getNamedAttr("dram", b.getI64IntegerAttr(tiler.plannedDram)),
+              b.getNamedAttr("dram_unconstrained",
+                             b.getI64IntegerAttr(tiler.unconstrainedDram)),
               b.getNamedAttr("price",
                              b.getF64FloatAttr(tiler.budgetPrice)),
           }));

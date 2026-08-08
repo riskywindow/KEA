@@ -450,15 +450,45 @@ into the other half, so its DMA cannot hide under its compute:
 doubleBufferable = 2*(inBytes + outBytes) <= KEA_SPM_A_BYTES
                 && 2*accWords             <= KEA_ACC_WORDS
                 && 2*(wBytes + qpBytes)   <= KEA_SPM_W_BYTES
-
-tile = sync + (doubleBufferable ? max(MXU, VPU, DMA) : MXU + VPU + DMA)
-total = nOcTiles * (weightDMA + nSpatialTiles * batch * tile)
 ```
 
 This is the one place the cost model reaches into `-kea-schedule`'s job, and it
 has to. Pricing every tile at `max()` would tell the search a tile twice as
 large is free, which is exactly wrong; pricing every tile at the sum would give
 up the overlap the two DMA engines exist for (ISA.md §12).
+
+**DRAM is costed per LAYER, not per tile — it is a roofline.** Taking
+`max(MXU, VPU, DMA)` per tile makes extra DRAM traffic *completely free* on any
+tile whose compute already dominates, so the search would happily buy
+instruction budget with bandwidth it cannot see it is spending. It did:
+coarsening the feature extractor to fit IMEM raised measured DRAM traffic
+22.9% and pushed the whole network from compute bound to memory bound. But the
+DRAM port is one shared 16 B/cycle resource for the entire program
+(`KEA_DRAM_BYTES_PER_CYCLE`, "SHARED by both engines"), so it is a *global*
+budget:
+
+```
+tileCompute = sync + (doubleBufferable ? max(MXU, VPU) : MXU + VPU)
+dramBytes   = weights + nTiles*(IH_p*IW_p*IC) + output [+ residual]
+fill        = nTiles > 1 ? perTileDMA : 0
+layer       = doubleBufferable ? fill + max(nTiles*tileCompute, totalDMA - fill)
+                               : nTiles*tileCompute + totalDMA
+```
+
+Costing a layer as `max(total compute, total DMA)` is exactly MICROARCH.md
+§9.2's roofline, and it has the property the per-tile form lacks: **a layer
+already past the ridge point pays for every extra byte, so it resists
+coarsening hard, while a compute-bound layer with bandwidth to spare coarsens
+freely until it reaches the ridge.** The `dramBytes` term is where coarsening
+actually shows up — halving `OCG_t` doubles the number of times the *entire*
+input is re-read, and shrinking the spatial tile re-reads more halo.
+
+`fill` is the software-pipeline prologue: within a tile loop the first tile's
+DMA has nothing to hide under. It is what stops the search coarsening without
+limit once IMEM is scarce. It is gated on there actually being a loop — a
+one-tile layer's overlap depends on its *neighbours*, which a per-layer model
+cannot see, so `max()` there is the same optimistic cross-layer assumption the
+rest of the model makes rather than an oversight.
 
 It also makes `spm-reserve-factor` largely redundant, which is why it now
 defaults to **1**. The factor was a blunt proxy for "leave room to double
@@ -562,53 +592,69 @@ Under the default budget the plan is coarser than this: the whole feature
 extractor is planned at 20,419 instructions instead of 25,642, at an estimated
 2,578,535 cycles instead of 2,004,382.
 
-### 5.5 The measured instruction/cycle trade-off
+### 5.5 The measured instruction/cycle/DRAM trade-off
 
 MobileNetV2's 179-node feature extractor (all 52 convolutions, 224x224), taken
 all the way to a `.keaf` and simulated. "tiled" is what `-kea-tile` emits;
-".kasm" is after `kea-translate --sync=auto` inserts synchronization; cycles are
-`kea-sim` totals with `--kea-schedule`.
+".kasm" is after `kea-translate --sync=auto` inserts synchronization; cycles
+and DRAM are `kea-sim` totals with `-kea-schedule`.
 
-| `spm-reserve` | `imem-budget` | tiled | .kasm | fits IMEM | cycles |
-|---|---|---|---|---|---|
-| 1 | (none — old behaviour) | 21,417 | 30,773 | yes | 3,235,612 |
-| 2 | (none — old default) | 25,642 | 41,409 | **no, +26%** | — |
-| 1 | 21,000 | 20,801 | 31,648 | yes | 3,179,147 |
-| **1** | **20,480 (new default)** | **20,419** | **30,430** | **yes** | **3,176,061** |
-| 1 | 20,400 | 20,353 | 30,144 | yes | 3,145,547 |
-| 1 | 20,000 | 19,909 | 28,634 | yes | **3,133,342** |
-| 1 | 19,600 | 19,589 | 26,212 | yes | 3,684,501 |
-| 1 | 19,200 | 19,159 | 26,336 | yes | 4,002,032 |
-| 1 | <= 19,000 | — | — | — | infeasible: the coarsest plan is 19,066 |
-| 2 | 21,000 | 20,785 | 31,816 | yes | 3,217,107 |
+| `imem-budget` | tiled | .kasm | fits IMEM | cycles | DRAM bytes | ops/byte |
+|---|---|---|---|---|---|---|
+| (none — greedy, pre-budget) | 25,642 | 41,409 | **no, +26%** | — | — | — |
+| 21,300 | 21,466 | 32,610 | yes | 3,179,786 | 20,989,644 | 28.54 |
+| 21,000 | 20,801 | 31,648 | yes | 3,179,158 | 21,591,756 | 27.74 |
+| 20,480 | 20,419 | 30,430 | yes | 3,176,072 | 21,591,756 | 27.74 |
+| **20,200 (default)** | **19,909** | **28,675** | **yes** | **3,129,389** | **21,254,028** | **28.18** |
+| 20,000 | 19,909 | 28,675 | yes | 3,129,389 | 21,254,028 | 28.18 |
+| 19,600 | 19,589 | 26,241 | yes | 3,687,796 | 21,179,596 | 28.28 |
+| 19,200 | 19,159 | 26,407 | yes | 4,011,331 | 21,418,780 | 27.97 |
+| <= 19,000 | — | — | — | infeasible: the coarsest plan is 19,066 | | |
 
-Read it in three parts.
+Read it in four parts.
 
-**The default now fits with no flags.** Before this work the only configuration
-that fitted IMEM was `--spm-reserve 1` with no instruction budget, and the demo
-was pinned to it. It now fits at the defaults and is 1.019x faster as well.
+**The default fits with no flags, and is the measured optimum.** Before the
+budget existed the only configuration that fitted IMEM was `--spm-reserve 1`
+with greedy tiling. The default now fits, schedules, and is the best point on
+the curve on all three axes at once — fewest instructions, fewest cycles and
+(within noise of) the least DRAM.
 
-**The curve is not monotonic, and its optimum is not where the cost model
-thinks it is.** Coarsening from 20,480 down to 20,000 instructions makes the
-program *faster* (3,176,061 -> 3,133,342) even though the tiler's own estimate
-says the opposite, and then coarsening further falls off a cliff. The tiler
-prices a tile in isolation; it cannot see dispatcher stalls on full queues, or
-how many `SIGNAL`/`WAIT` pairs the downstream passes will insert, or how well
-they will overlap. `imem-budget` exists partly so that measured optimum can be
-selected rather than argued about — for this network, `20000` is worth a
-further 1.3%.
+**The curve is not monotonic, and the cost model cannot predict where its
+optimum is.** Coarsening from 20,480 to 20,200 instructions makes the program
+*faster*, and then coarsening further falls off a cliff. `imem-budget`
+therefore defaults to a **measured** constant, not a modelled one. That is
+stated plainly rather than dressed up: the tiler prices a tile in isolation and
+cannot see the dispatcher, the queues, or how many `SIGNAL`/`WAIT` pairs the
+downstream passes will insert.
 
-**Scheduling and program size pull against each other, and program size wins
-here.** `-kea-schedule` is worth 1.181x at the default budget (3,727,589
-unscheduled vs 3,176,061 scheduled). It was measured at 1.484x on the first 98
-nodes at `--spm-reserve 2` — but that is a prefix that fits IMEM without
-squeezing, and the full feature extractor at reserve 2 does not: its coarsest
-plan is already 20,765 tiled instructions, and the tiles that coarse cost more
-than the overlap buys (3,217,107, worse than reserve 1 at the same budget).
-The honest summary is that on the *whole* feature extractor the reserve factor
-is worth much less than 1.484x once IMEM is respected, and that the largest
-remaining lever is not tile size but the 44-61% of the program that
-synchronization occupies.
+**DRAM blindness is NOT the explanation — that was measured and ruled out.**
+Pricing DRAM as a roofline (§5.3) changed every layer's *cost* but not the
+chosen plan at the default, and left the curve's shape unchanged. The
+simulator says why: `port_busy_cycles` is flat at ~1.33M across the whole
+window, i.e. the DRAM port runs at ~42% duty and is never the binding
+constraint, even though the *intensity* is below the 32.0 ridge. What tracks
+total cycles is **MXU semaphore stall**, which rises 1.33M -> 1.79M -> 2.10M
+across the bottom of the curve while DRAM stays flat:
+
+| `imem-budget` | cycles | DRAM port busy | MXU semaphore stall |
+|---|---|---|---|
+| 20,480 | 3,176,072 | 1,349,492 | 1,327,411 |
+| 20,200 | 3,129,389 | 1,335,440 | 1,355,717 |
+| 19,600 | 3,687,796 | 1,323,736 | 1,790,195 |
+| 19,200 | 4,011,331 | 1,338,681 | 2,097,712 |
+
+So the cliff is a *pipelining* effect, not a bandwidth one: past a point there
+are too few, too large tiles for anything to overlap with. That is what the
+`fill` term in §5.3 models, and modelling it is what moved the optimum onto the
+default.
+
+**The roofline flag and the actual bottleneck disagree, and both are right.**
+`intensity = 28.18 < 32` says the network is memory bound *given perfect
+overlap*; `port_busy = 42%` says the achieved schedule is nowhere near using
+the port. The gap between them is headroom the scheduler has not taken yet.
+The one structural change that would move intensity above the ridge is
+inter-layer SPM residency (§9) — every layer currently round-trips its
+activations through DRAM, which is most of the 21 MB.
 
 ## 6. The convolution lowering (ISA.md §8.5, normative)
 
@@ -770,6 +816,63 @@ activation DMA gathers `C` of every `C_pad` bytes (one run per pixel) and the
 output DMA scatters them back; when `C_pad == C` — which is every real
 MobileNetV2 depthwise layer, all of 32/96/144/192/384/576/960 being multiples of
 16 — both are one contiguous run per row.
+
+### 6.7 A standalone rescale — the identity MATMUL
+
+`VQUANT` *is* a rescale, but it can only read ACC (isa.h `KeaVquant`:
+`acc_addr` is an ACC word index), and ACC is writable only by the MXU and the
+DWU — ISA.md §10.4 says so outright: *"ACC is not reachable from `VCOPY`;
+initialize accumulators with `MATMUL`/`DWCONV` `accumulate=0` instead."* So a
+tensor sitting in SPM_A cannot be requantized in place, and a `kea.rescale`
+that `-kea-fuse` could not fold into a contraction has no obvious home.
+
+The way in is to multiply it by the identity. `LOAD_W` a 16x16 identity tile
+and a `MATMUL` streams a 16-channel slice of SPM_A into ACC unchanged, since
+`acc[n] = sum_k A[k]*I[k][n] = A[n]`; `VQUANT` then requantizes it there. Per
+16-channel group:
+
+```
+kea.load_w  identity, k_rows = n_cols = min(16, C - g*16), bank = t & 1
+kea.mm      a_addr = g*16, a_inner_stride = C, m_inner = pixels, m_outer = 1,
+            acc_addr = 0, acc_inner_stride = 16, acc_outer_stride = 16
+kea.vquant  acc_addr = 0, out_addr = g*16, channels = 16,
+            acc_pix_stride = 16, out_pix_stride = roundUp(C,16)
+```
+
+**It needs no new contract on `-kea-emit` at all.** The zero-point fold the
+emitter already performs for every contraction,
+`bias[c] = bias_l1[c] - input_zp * sum_k w[c][k]`, becomes exactly `-input_zp`
+because the identity's row sum is 1 — which is precisely what a rescale needs.
+The identity goes through the ordinary `mxu_tiles_16x16` path as a
+`tensor<16x1x1x16xi8>` constant, one 256-byte tile shared by every group, and
+each group gets a 16-record `quant_params` block (shared outright when the
+rescale is per tensor, sliced from the `#kea.quant` when it is per channel,
+because the emitter sizes that block by the weight tensor's output channels).
+
+Two costs, both stated rather than hidden:
+
+* **The MXU runs at 1/16 utilization**, because 15 of its 16 reduction lanes
+  multiply by zero. That is the right trade for MobileNetV2's head, which
+  rescales a single 1280-channel pixel; it would be a poor way to rescale a
+  large feature map, and a future `-kea-fuse` that folds the rescale into the
+  pool's consumer would beat it.
+* **`VADD` against a zero operand would be cheaper** — a pure VPU pass, no MXU
+  and no ACC — and is deliberately *not* used. `keaQuantizedAdd` applies two
+  multiply-shift roundings where TOSA applies one, and ADR-0003's equivalence
+  result covers `keaRequantize`, not that composition. The demo compares
+  bit-exactly against the golden reference, so an extra ulp is a failure.
+
+This is what unblocks a scale-changing pool. MobileNetV2's head converts
+0.023529 -> 0.016946 across its global average pool, so the frontend emits
+`avg_pool2d` + `tosa.rescale`; `kea.pool`'s `quant` is restricted by its own
+verifier to a zero-point rebase (averaging is affine, and only that much is
+exact), so the rescale survives `-kea-fuse` and lands here. Verified bit-exact
+against a numpy reference of `keaPoolAverage` + `apply_scale_32`, with
+`--strict-poison --strict-hazards` clean.
+
+It does **not** make MobileNetV2 a single program: at the coarsest tiling of
+every layer the whole graph is ~36,600 instructions against a 32,768-entry
+IMEM. The two-program split is a capacity result, not a missing lowering.
 
 ---
 
@@ -944,10 +1047,14 @@ Stated plainly rather than stubbed:
   a SPM_W budget term for a `K*N` activation, and the worst-case accumulator
   bound instead of the weight-derived one (§7.2), since the values are not
   known at compile time.
-* **`kea.transpose`, standalone `kea.rescale`, standalone `kea.clamp`.** KEA-1
-  has no transpose unit (ISA.md §13) and no way to requantize a tensor that
-  never entered ACC. `-kea-fuse` is expected to eliminate all three; if one
-  survives, `-kea-tile` refuses with a diagnostic saying so.
+* **`kea.transpose` and standalone `kea.clamp`.** KEA-1 has no transpose unit
+  (ISA.md §13), and a clamp with no requantization to ride along with is not an
+  instruction. `-kea-fuse` is expected to eliminate both; if one survives,
+  `-kea-tile` refuses with a diagnostic saying so.
+
+  A standalone **`kea.rescale` is lowered** (§6.7), except from `i32` — an i32
+  operand is an accumulator that never left ACC, and nothing can put one back
+  there.
 * **Dilated depthwise.** `DWCONV` has no dilation field. ISA.md §9.1 suggests
   emulating it by scaling the activation strides, but that also scales the
   *output* stride, so it needs a re-slice that is not implemented.

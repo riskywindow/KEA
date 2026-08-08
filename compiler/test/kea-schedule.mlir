@@ -1,9 +1,9 @@
-// RUN: kea-opt %s -split-input-file -kea-schedule | FileCheck %s
-// RUN: kea-opt %s -split-input-file -kea-schedule | kea-opt -split-input-file -kea-tile | FileCheck %s --check-prefix=REVALIDATE
-// RUN: kea-opt %s -split-input-file -kea-schedule=report-schedule=true | FileCheck %s --check-prefix=REPORT
-// RUN: kea-opt %s -split-input-file -kea-schedule | kea-opt -split-input-file -kea-schedule | FileCheck %s --check-prefix=IDEMPOTENT
-// RUN: kea-opt %s -split-input-file -kea-schedule | FileCheck %s --check-prefix=ENGINES
-// RUN: kea-opt %s -split-input-file "-kea-schedule=report-schedule=true queue-depth=2" | FileCheck %s --check-prefix=QDEPTH
+// RUN: kea-opt %s -split-input-file -kea-schedule=mode=overlap | FileCheck %s
+// RUN: kea-opt %s -split-input-file -kea-schedule=mode=overlap | kea-opt -split-input-file -kea-tile | FileCheck %s --check-prefix=REVALIDATE
+// RUN: kea-opt %s -split-input-file "-kea-schedule=mode=overlap report-schedule=true" | FileCheck %s --check-prefix=REPORT
+// RUN: kea-opt %s -split-input-file -kea-schedule=mode=overlap | kea-opt -split-input-file -kea-schedule=mode=overlap | FileCheck %s --check-prefix=IDEMPOTENT
+// RUN: kea-opt %s -split-input-file -kea-schedule=mode=overlap | FileCheck %s --check-prefix=ENGINES
+// RUN: kea-opt %s -split-input-file "-kea-schedule=mode=overlap report-schedule=true queue-depth=2" | FileCheck %s --check-prefix=QDEPTH
 //
 // -kea-schedule: the correct *sequential* Level 2 program -kea-tile emits
 // becomes a correctly synchronized *concurrent* one. docs/SCHEDULING.md is the
@@ -404,13 +404,25 @@ func.func @serial_baseline() {
 // arithmetic, which is what makes errata E4 -- "the region keeps accumulating
 // until the issuing unit's pipeline drains" -- attribute the tail of a layer
 // to that layer.
-
+//
+// AND IT STAYS THERE. A `kea.trace` has no operands, so nothing in the
+// dependence graph holds it anywhere; if it is placed at the earliest stream
+// position of *anything* in its region it follows whatever floated furthest.
+// Here the region's `kea.dma_load` depends on nothing and is issued first, and
+// the marker must NOT follow it -- `begin` sits immediately before the first
+// MXU instruction of the region, which is the work it was emitted to bracket.
+// On the MobileNetV2 feature extractor the difference is 52 regions summing to
+// 23.6M cycles inside a 3.18M-cycle program versus 3.36M inside 3.18M.
+//
 // CHECK-LABEL: func.func @regions_get_a_queue
-// CHECK: kea.trace "begin" 7 {unit = "MXU"}
-// CHECK: kea.dma_load
-// CHECK: kea.mm
-// CHECK: kea.trace "end" 7 {unit = "MXU"}
-// CHECK: kea.halt
+// CHECK:       kea.dma_load
+// CHECK:       kea.signal 0 {unit = "DMA0"}
+// CHECK-NEXT:  kea.trace "begin" 7 {unit = "MXU"}
+// CHECK-NEXT:  kea.wait 0 {unit = "MXU"}
+// CHECK-NEXT:  kea.load_w
+// CHECK:       kea.mm
+// CHECK-NEXT:  kea.trace "end" 7 {unit = "MXU"}
+// CHECK-NEXT:  kea.halt
 func.func @regions_get_a_queue() {
   %dw = kea.alloc {name = "r.dw", role = "weights"} : !kea.buffer<256xi8, DRAM>
   %w = kea.alloc {name = "r.w", role = "scratch"} : !kea.buffer<256xi8, W>

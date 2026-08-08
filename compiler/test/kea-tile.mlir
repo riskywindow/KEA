@@ -79,7 +79,7 @@
 // and -kea-tile only spends half of each scratchpad so -kea-schedule can
 // double buffer.
 // TILES-LABEL: func.func @conv3x3_s1
-// TILES-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 3680 : i64, spm_w = 4992 : i64, taps = 144 : i64}]
+// TILES-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 3680 : i64, spm_w = 4992 : i64, taps = 144 : i64}]
 func.func @conv3x3_s1(%in: tensor<1x8x8x16xi8>, %w: tensor<32x3x3x16xi8>)
     -> tensor<1x8x8x32xi8> {
   %0 = kea.conv2d %in, %w {zero_points = #kea.zp<input = -5, weight = 0>,
@@ -137,7 +137,7 @@ func.func @conv1x1(%in: tensor<1x8x8x32xi8>, %w: tensor<16x1x1x32xi8>)
 // CHECK-NEXT: kea.vquant %{{.*}} {acc_addr = 0 : i64, acc_pix_stride = 32 : i64, channels = 32 : i64, clamp_hi = 127 : i64, clamp_lo = -128 : i64, num_pixels = 16 : i64, out_addr = 0 : i64, out_pix_stride = 32 : i64, out_zp = -128 : i64, qparam_addr = 0 : i64}
 
 // TILES-LABEL: func.func @dwconv_s2
-// TILES-SAME: {acc = 512 : i64, channels = 32 : i64, layer = 0 : i64, oh = 4 : i64, op = "kea.dwconv2d", ow = 4 : i64, spm_a = 3136 : i64, spm_w = 672 : i64, taps = 9 : i64}
+// TILES-SAME: {acc = 512 : i64, channels = 32 : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 0 : i64, oh = 4 : i64, op = "kea.dwconv2d", ow = 4 : i64, spm_a = 3136 : i64, spm_w = 672 : i64, taps = 9 : i64}
 func.func @dwconv_s2(%in: tensor<1x8x8x32xi8>, %w: tensor<32x3x3x1xi8>)
     -> tensor<1x4x4x32xi8> {
   %0 = kea.dwconv2d %in, %w {zero_points = #kea.zp<input = -128, weight = 0>,
@@ -351,4 +351,53 @@ func.func @banks_alternate_across_groups(%in: tensor<1x8x8x16xi8>,
                     rounding = DOUBLE>>}
     : (tensor<1x8x8x16xi8>, tensor<64x1x1x16xi8>) -> tensor<1x8x8x64xi8>
   return %0 : tensor<1x8x8x64xi8>
+}
+
+//===--------------------------------------------------------------------===//
+// A standalone rescale -- an identity MATMUL into ACC, then VQUANT
+//===--------------------------------------------------------------------===//
+//
+// `VQUANT` *is* a rescale, but it can only read ACC (isa.h `KeaVquant`:
+// `acc_addr` is an ACC word index), and ACC is writable only by the MXU and
+// the DWU -- ISA.md §10.4 says so outright: "ACC is not reachable from VCOPY;
+// initialize accumulators with MATMUL/DWCONV accumulate=0 instead." A tensor
+// sitting in SPM_A therefore cannot be requantized in place.
+//
+// The way in is to multiply it by the identity: `LOAD_W` a 16x16 identity and
+// `MATMUL` streams a 16-channel slice of SPM_A into ACC unchanged, because
+// `acc[n] = sum_k A[k]*I[k][n] = A[n]`. The zero-point fold -kea-emit already
+// does for every contraction, `bias[c] = bias_l1[c] - input_zp*sum_k w[c][k]`,
+// then becomes exactly `-input_zp` because the identity's row sum is 1 -- which
+// is what a rescale needs. So this needs no new emitter contract at all.
+//
+// This is what unblocks a scale-changing pool: MobileNetV2's head converts
+// 0.023529 -> 0.016946 across its global average pool, which the frontend
+// emits as avg_pool2d + tosa.rescale, and `kea.pool`'s `quant` is restricted
+// by its own verifier to a zero-point rebase.
+
+// CHECK-LABEL: func.func @standalone_rescale
+// The identity, laid out through the ordinary weight path.
+// CHECK: kea.alloc from %{{.*}} : tensor<16x1x1x16xi8> {layout = "mxu_tiles_16x16", {{.*}}role = "weights"} : !kea.buffer<256xi8, DRAM>
+// One KeaQuantParam block per 16-channel group; per tensor, so they share the
+// same `quant` and differ only in where they land in SPM_W.
+// CHECK: kea.alloc from %{{.*}} {input_zp = -128 : i64, layout = "quant_params", {{.*}}role = "qparam"} : !kea.buffer<192xi8, DRAM>
+// CHECK: kea.trace "begin"
+// 64 channels = 4 groups. Each is one identity LOAD_W, one MATMUL that copies
+// the group into ACC (`accumulate` absent -- it overwrites), and one VQUANT.
+// CHECK: kea.load_w %{{.*}} {bank = 0 : i64, k_rows = 16 : i64, n_cols = 16 : i64, w_addr = 0 : i64, w_row_stride = 16 : i64}
+// CHECK-NEXT: kea.mm %{{.*}} {a_addr = 0 : i64, a_inner_stride = 64 : i64, a_outer_stride = 64 : i64, acc_addr = 0 : i64, acc_inner_stride = 16 : i64, acc_outer_stride = 16 : i64, bank = 0 : i64, m_inner = 1 : i64, m_outer = 1 : i64}
+// CHECK-NEXT: kea.vquant %{{.*}} {acc_addr = 0 : i64, acc_pix_stride = 16 : i64, channels = 16 : i64, clamp_hi = 127 : i64, clamp_lo = -128 : i64, num_pixels = 1 : i64, out_addr = 0 : i64, out_pix_stride = 64 : i64, out_zp = -128 : i64, qparam_addr = 0 : i64}
+// The next group reads the next 16 channels of the same pixel and writes the
+// next 16 bytes of the output, with the bank alternating as everywhere else.
+// CHECK-NEXT: kea.load_w %{{.*}} {bank = 1 : i64,
+// CHECK-NEXT: kea.mm %{{.*}} {a_addr = 16 : i64, {{.*}}bank = 1 : i64
+// CHECK-NEXT: kea.vquant %{{.*}} {{{.*}}out_addr = 16 : i64, {{.*}}qparam_addr = 192 : i64}
+// CHECK: kea.dma_store
+// CHECK: kea.halt
+func.func @standalone_rescale(%x: tensor<1x1x1x64xi8>) -> tensor<1x1x1x64xi8> {
+  %0 = kea.rescale %x {quant = #kea.quant<multiplier = [1490907399],
+        shift = [30], input_zp = -128, output_zp = -128, axis = -1,
+        rounding = DOUBLE>}
+    : (tensor<1x1x1x64xi8>) -> tensor<1x1x1x64xi8>
+  return %0 : tensor<1x1x1x64xi8>
 }

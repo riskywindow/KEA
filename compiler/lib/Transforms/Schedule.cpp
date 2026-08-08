@@ -195,6 +195,7 @@ struct Node {
   int origIndex = 0; ///< position in -kea-tile's sequential program
   int queue = -1;    ///< QMXU..QDMA1; chosen during scheduling for DMA
   bool dma = false;  ///< queue is not fixed by the opcode
+  int region = -1;   ///< index into Sched::regions, -1 outside every region
   int64_t occ = 0;   ///< resource occupancy, cycles
   int64_t bytes = 0; ///< DRAM bytes (DMA only)
   SmallVector<int, 4> preds;
@@ -233,10 +234,12 @@ struct BufferInfo {
 
 struct Sched {
   Sched(func::FuncOp f, StringRef m, int64_t depth, int64_t margin,
-        bool annotate)
+        int64_t lookahead, int64_t decline, bool annotate)
       : func(f), mode(m), serial(m == "serial"), annotateUnits(annotate) {
     queueDepth = depth > 0 ? depth : (int64_t)::kea::KEA_QUEUE_DEPTH;
     fragMargin = std::min<int64_t>(std::max<int64_t>(margin, 0), 50);
+    regionLookahead = std::max<int64_t>(lookahead, 0);
+    declineMargin = std::min<int64_t>(std::max<int64_t>(decline, 0), 90);
   }
 
   func::FuncOp func;
@@ -246,6 +249,8 @@ struct Sched {
   bool annotateUnits = true;
   int64_t queueDepth = ::kea::KEA_QUEUE_DEPTH;
   int64_t fragMargin = 6;
+  int64_t regionLookahead = 1;
+  int64_t declineMargin = 5;
 
   SmallVector<Node> nodes;
   SmallVector<Region> regions;
@@ -298,8 +303,9 @@ struct Sched {
   void assignSync();
   void locateRegions();
   void materialize();
-  void hoistAllocs();
+  void hoistAllocs(bool tight);
   LogicalResult checkRuleD();
+  LogicalResult checkRegions();
   void report();
 };
 
@@ -357,6 +363,7 @@ void Sched::collect() {
     n.origIndex = (int)nodes.size();
     n.queue = fixedQueueOf(&op);
     n.dma = n.queue < 0;
+    n.region = regionStack.empty() ? -1 : regionStack.back();
     n.occ = occupancyOf(&op);
     n.bytes = dmaBytesOf(&op);
     nodes.push_back(n);
@@ -547,6 +554,21 @@ void Sched::listSchedule(bool inOrder) {
   std::array<SmallVector<int64_t, 32>, QCOUNT> pending;
   std::array<int64_t, 4> spaceUse = {};
 
+  // §4.3's region locality bound. `remaining[r]` counts the instructions of
+  // region r still to be emitted; `openRegion` is the lowest region that still
+  // has any. A candidate more than `regionLookahead` regions past it is
+  // deferred while anything nearer is available.
+  SmallVector<int> remaining(regions.size(), 0);
+  for (const Node &nd : nodes)
+    if (nd.region >= 0)
+      remaining[nd.region]++;
+  int openRegion = 0;
+  auto advanceOpenRegion = [&]() {
+    while (openRegion < (int)remaining.size() && remaining[openRegion] == 0)
+      ++openRegion;
+  };
+  advanceOpenRegion();
+
   int64_t dispatch = 0;
   SmallVector<int> ready;
   for (int i = 0; i < n; ++i)
@@ -582,7 +604,7 @@ void Sched::listSchedule(bool inOrder) {
     int best = -1, bestQueue = -1;
     int64_t bestKey = 0, bestStart = 0, bestOcc = 0, bestStall = 0;
     int64_t bestHeight = 0;
-    bool bestFits = false;
+    int bestRank = 0;
 
     for (int cand : ready) {
       Node &nd = nodes[cand];
@@ -603,6 +625,12 @@ void Sched::listSchedule(bool inOrder) {
         if (delta[s] &&
             spaceUse[s] + delta[s] > spaceCapacity((AddressSpace)s))
           fits = false;
+      // Running many layers ahead buys nothing and costs plenty; see §4.3.
+      const bool nearby =
+          nd.region < 0 || nd.region <= openRegion + regionLookahead;
+      // Capacity first, locality second, so a candidate that does not fit is
+      // never preferred to one that does merely for being nearer.
+      const int rank = (fits ? 0 : 2) + (nearby ? 0 : 1);
 
       SmallVector<int, 2> qs;
       if (nd.queue >= 0)
@@ -694,8 +722,8 @@ void Sched::listSchedule(bool inOrder) {
         better = true;
       else if (inOrder)
         better = cand < best;
-      else if (fits != bestFits)
-        better = fits;
+      else if (rank != bestRank)
+        better = rank < bestRank;
       else if (key != bestKey)
         better = key < bestKey;
       else if (nd.height != bestHeight)
@@ -710,7 +738,7 @@ void Sched::listSchedule(bool inOrder) {
         bestOcc = chosenOcc;
         bestStall = chosenStall;
         bestHeight = nd.height;
-        bestFits = fits;
+        bestRank = rank;
       }
     }
 
@@ -753,6 +781,9 @@ void Sched::listSchedule(bool inOrder) {
       if (--bi.liveCount == 0)
         spaceUse[(int)bi.space] -= bi.extent;
     }
+
+    if (nd.region >= 0 && --remaining[nd.region] == 0)
+      advanceOpenRegion();
 
     ready.erase(llvm::find(ready, best));
     for (int s : nd.succs)
@@ -924,19 +955,49 @@ void Sched::locateRegions() {
     if (q < 0)
       q = nodes[r.firstOrig].queue;
     r.queue = q;
-    // The markers bracket every instruction of the region, on whichever queue
-    // it ended up: a region's counters cover every unit's activity in its
-    // cycle window (SIMULATOR.md §5), so a layer must own the DMA that feeds
-    // it. Software pipelining means consecutive regions can overlap, which
-    // errata E4 already anticipates and which is the honest attribution: the
-    // tail of layer n really is executing while layer n+1 starts.
+    // THE MARKERS BRACKET THE REGION'S INSTRUCTIONS ON ITS OWN QUEUE, not
+    // across every queue. Bracketing across all of them sounds more faithful --
+    // SIMULATOR.md §5 does say a region's counters cover every unit's activity
+    // in its window, so a layer should own the DMA that feeds it -- but it does
+    // not survive software pipelining, and the failure is not subtle. A
+    // `kea.trace` has no operands, so nothing in the dependence graph holds it
+    // anywhere; it is placed here, at the earliest stream position of the work
+    // it brackets. Some of that work floats: a residual layer's 20-byte
+    // `addparams` DMA depends on nothing at all, so the list scheduler issues
+    // it in the first hundred instructions, and the marker followed it.
+    // Measured on the MobileNetV2 feature extractor: 11 of 52 region-begin
+    // markers opened inside the first 100 of 30,430 instructions and the 52
+    // regions summed to 23.6M cycles inside a 3.18M-cycle program. Per-layer
+    // roofline is a headline deliverable and TRACE exists to make it
+    // trustworthy (ISA.md §5.4), so that is not a defensible trade.
+    //
+    // Keying on the region's own queue keeps each window to its own layer. The
+    // queue that does a region's arithmetic runs its instructions in order --
+    // guaranteed for MXU (§2.3), and enforced for the others by the region
+    // locality bound in §4.3 -- so consecutive regions on one queue cannot
+    // interleave. Work hoisted out of a layer is then attributed to whatever
+    // was executing when it actually ran, which is the standard convention for
+    // pipelined code and the one errata E4 already describes for a single
+    // pipeline depth.
     for (int i = r.firstOrig; i <= r.lastOrig && i < (int)nodes.size(); ++i) {
+      if (nodes[i].queue != q)
+        continue;
       const int sp = nodes[i].streamPos;
       if (r.lo < 0 || sp < r.lo)
         r.lo = sp;
       if (sp > r.hi)
         r.hi = sp;
     }
+    // A region with nothing on its own queue (none exists today: `q` is chosen
+    // from the region's own instructions) falls back to bracketing all of them.
+    if (r.lo < 0)
+      for (int i = r.firstOrig; i <= r.lastOrig && i < (int)nodes.size(); ++i) {
+        const int sp = nodes[i].streamPos;
+        if (r.lo < 0 || sp < r.lo)
+          r.lo = sp;
+        if (sp > r.hi)
+          r.hi = sp;
+      }
     auto name = StringAttr::get(func.getContext(), queueName(q));
     r.begin->setAttr("unit", name);
     r.end->setAttr("unit", name);
@@ -1047,8 +1108,20 @@ void Sched::materialize() {
 // exactly one tile -- which is precisely the window `-kea-tile`'s
 // `spm-reserve-factor = 2` was sized for.
 
-void Sched::hoistAllocs() {
+void Sched::hoistAllocs(bool tight) {
   const int n = (int)order.size();
+  if (tight) {
+    // Nothing was reordered and nothing will be emitted, so the ranges are
+    // -kea-tile's own and need no widening: the alloc stays at its first user.
+    for (BufferInfo &bi : buffers) {
+      int lo = std::numeric_limits<int>::max();
+      for (int uid : bi.users)
+        lo = std::min(lo, nodes[uid].streamPos);
+      if (lo != std::numeric_limits<int>::max())
+        bi.hoistTo = lo;
+    }
+    return;
+  }
   // Per space, per queue: the stream positions of instructions touching an
   // on-chip buffer in that space, ascending.
   std::array<std::array<SmallVector<int>, QCOUNT>, 3> touch;
@@ -1116,6 +1189,45 @@ LogicalResult Sched::checkRuleD() {
   return success();
 }
 
+/// Regions on one queue must not interleave.
+///
+/// `kea-sim` nests regions per `(unit, tag)` and reports each one's window as
+/// `end - begin`, so two regions that open and close alternately on the same
+/// queue produce windows that overlap without nesting -- and their cycle counts
+/// then double-count the overlap instead of partitioning it. That is what makes
+/// a per-layer roofline untrustworthy, and it is exactly the failure the
+/// unbounded scheduler produced: 52 regions summing to 23.6M cycles inside a
+/// 3.18M-cycle program.
+///
+/// The property is structural and cheap, so it is checked rather than assumed.
+/// Two things establish it: markers are placed on the queue that does the
+/// region's arithmetic (§5), and that queue's instructions stay within
+/// `region-lookahead` regions of each other (§4.3). If either stops holding,
+/// this fires and names the two regions.
+LogicalResult Sched::checkRegions() {
+  SmallVector<Region *> byQueue[QCOUNT];
+  for (Region &r : regions)
+    if (r.begin && r.end && r.lo >= 0)
+      byQueue[r.queue].push_back(&r);
+  for (int q = 0; q < QCOUNT; ++q) {
+    SmallVector<Region *> &v = byQueue[q];
+    llvm::sort(v, [](const Region *a, const Region *b) { return a->lo < b->lo; });
+    for (size_t i = 1; i < v.size(); ++i) {
+      Region *prev = v[i - 1], *cur = v[i];
+      // Disjoint, or `cur` fully inside `prev` -- anything else interleaves.
+      if (cur->lo > prev->hi || cur->hi <= prev->hi)
+        continue;
+      return cur->begin->emitOpError("region ")
+             << cur->begin.getTag() << " interleaves with region "
+             << prev->begin.getTag() << " on " << queueName(q)
+             << ": their TRACE windows would overlap without nesting, so "
+                "kea-sim's per-region cycle counts would double-count the "
+                "overlap instead of partitioning it";
+    }
+  }
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // 8. The report
 //===----------------------------------------------------------------------===//
@@ -1139,6 +1251,8 @@ void Sched::report() {
       b.getNamedAttr("dispatch_stall", b.getI64IntegerAttr(dispatchStall)),
       b.getNamedAttr("queue_depth", b.getI64IntegerAttr(queueDepth)),
       b.getNamedAttr("fragmentation_margin", b.getI64IntegerAttr(fragMargin)),
+      b.getNamedAttr("region_lookahead", b.getI64IntegerAttr(regionLookahead)),
+      b.getNamedAttr("decline_margin", b.getI64IntegerAttr(declineMargin)),
       b.getNamedAttr("events", b.getI64IntegerAttr(numEvents)),
       b.getNamedAttr("signals", b.getI64IntegerAttr(nSignals)),
       b.getNamedAttr("waits", b.getI64IntegerAttr(nWaits)),
@@ -1222,7 +1336,14 @@ int64_t Sched::computePlan(bool inOrder) {
   bool fits = false;
   for (capacityIters = 0;; ++capacityIters) {
     nodes = baseGraph;
-    for (int s = 0; s < 3; ++s) {
+    // The in-order plan models what the backend emits when this pass DECLINES
+    // (§9): -kea-tile's IR untouched, with `-kea-emit` deriving its sync from
+    // post-allocation storage intervals. That program has no widened live
+    // ranges, so it needs none of the rotation edges §6.2 adds to keep the
+    // widened ones placeable. Charging it for them made the estimate up to 8%
+    // pessimistic -- enough to make `auto` prefer a plan that was really 6%
+    // worse -- so it is not charged for them.
+    for (int s = 0; s < 3 && !inOrder; ++s) {
       const SmallVector<int> &v = perSpace[s];
       for (int i = window[s]; i < (int)v.size(); ++i) {
         const BufferInfo &prev = buffers[v[i - window[s]]];
@@ -1272,7 +1393,7 @@ int64_t Sched::computePlan(bool inOrder) {
     else
       listSchedule(inOrder);
     assignSync();
-    hoistAllocs();
+    hoistAllocs(/*tight=*/inOrder);
     const std::array<int64_t, 3> peak = spmPeak();
     fits = true;
     bool reduced = false;
@@ -1371,39 +1492,52 @@ LogicalResult Sched::run(bool reportSchedule) {
   // `kea-sim` on a 28-convolution MobileNetV2 prefix -- so the pass can simply
   // decline instead of regressing.
   if (serial) {
-    computePlan(/*inOrder=*/false);
+    computePlan(/*inOrder=*/false); // serialSchedule() inside
+  } else if (mode == "overlap") {
+    modelledOverlap = computePlan(/*inOrder=*/false);
+    if (!planFits) {
+      // The widened ranges are not placeable. Emitting them would turn this
+      // pass's aggressiveness into -kea-alloc's failure; `serial` always fits,
+      // because nothing in it is concurrent and every range is -kea-tile's.
+      serial = true;
+      computePlan(/*inOrder=*/false);
+      chosenPlan = "serial";
+    }
   } else {
-    // Cost the overlapped plan and, unless the caller insisted on it, the
-    // in-order one, and keep the cheaper of the plans that FIT. A plan that
-    // does not fit is one whose widened ranges -kea-alloc provably cannot
-    // place; emitting it would turn this pass's aggressiveness into that
-    // pass's failure. `serial` is the floor and always fits, because nothing
-    // in it is concurrent and every range is the one -kea-tile sized.
+    // DECLINE RATHER THAN REORDER, AND DECLINE BY LEAVING THE IR ALONE.
+    //
+    // The in-order plan models the program the backend emits when this pass
+    // does nothing: -kea-tile's order, one engine, sync from storage. So the
+    // comparison is against *not scheduling*, not against some weaker in-house
+    // baseline like `mode=serial`, which synchronizes every cross-queue
+    // adjacency and is 9% slower than not scheduling at all.
+    //
+    // The overlapped plan has to clear a margin as well as win. Both estimates
+    // come from the same cost model so the difference is meaningful, but a 1%
+    // predicted win is inside the model's error and is not worth reordering
+    // for. Measured on the MobileNetV2 feature extractor at
+    // `imem-budget=19100`, where SPM_A has room for exactly one activation
+    // tile and there is nothing to double buffer, the overlapped plan was
+    // predicted 0.8% better and measured 6% worse.
+    //
+    // Declining emits *nothing*: no reordering, no rotation edges, no widened
+    // live ranges. `-kea-emit` then derives its semaphores from post-allocation
+    // storage intervals exactly as it does without `--schedule`, and
+    // `-kea-alloc` packs -kea-tile's own ranges. A pass that has decided not to
+    // help should not still be charging for the attempt.
     modelledOverlap = computePlan(/*inOrder=*/false);
     const bool overlapFits = planFits;
-    bool useOverlap = overlapFits;
-    if (mode == "auto" || !overlapFits) {
-      modelledInOrder = computePlan(/*inOrder=*/true);
-      const bool inOrderFits = planFits;
-      if (!inOrderFits)
-        useOverlap = overlapFits;
-      else if (!overlapFits)
-        useOverlap = false;
-      else
-        useOverlap = modelledOverlap < modelledInOrder;
-      if (!overlapFits && !inOrderFits) {
-        serial = true;
-        computePlan(/*inOrder=*/false);
-        chosenPlan = "serial";
-      } else if (useOverlap) {
-        computePlan(/*inOrder=*/false);
-        chosenPlan = "overlap";
-      } else {
-        chosenPlan = "in-order";
-      }
-    } else {
-      chosenPlan = "overlap";
+    modelledInOrder = computePlan(/*inOrder=*/true);
+    const bool worthIt =
+        overlapFits &&
+        modelledOverlap * 100 < modelledInOrder * (100 - declineMargin);
+    if (!worthIt) {
+      chosenPlan = "declined";
+      if (reportSchedule)
+        report();
+      return success();
     }
+    computePlan(/*inOrder=*/false);
   }
 
   if (numEvents > ::kea::KEA_NUM_EVENTS)
@@ -1417,7 +1551,8 @@ LogicalResult Sched::run(bool reportSchedule) {
   // Any pass that inserts, erases or moves a Level 2 op must re-stamp the
   // live ranges (DIALECT_L2.md §4.2). This pass does all three.
   refreshLiveRanges(func);
-  if (failed(verifyWeightBanks(func)) || failed(checkRuleD()))
+  if (failed(verifyWeightBanks(func)) || failed(checkRuleD()) ||
+      failed(checkRegions()))
     return failure();
   if (reportSchedule)
     report();
@@ -1459,7 +1594,8 @@ struct KeaSchedulePass
       return;
     }
 
-    Sched s(func, mode, queueDepth, fragmentationMargin, annotateUnits);
+    Sched s(func, mode, queueDepth, fragmentationMargin, regionLookahead,
+            declineMargin, annotateUnits);
     if (failed(s.run(reportSchedule)))
       return signalPassFailure();
     numSignals += s.nSignals;

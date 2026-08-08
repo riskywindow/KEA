@@ -1,6 +1,6 @@
-// RUN: kea-opt %s -kea-schedule | FileCheck %s
-// RUN: kea-opt %s -kea-schedule=report-schedule=true | FileCheck %s --check-prefix=REPORT
-// RUN: kea-opt %s -kea-schedule | kea-opt -kea-tile | FileCheck %s --check-prefix=REVALIDATE
+// RUN: kea-opt %s -kea-schedule=mode=overlap | FileCheck %s
+// RUN: kea-opt %s "-kea-schedule=mode=overlap report-schedule=true" | FileCheck %s --check-prefix=REPORT
+// RUN: kea-opt %s -kea-schedule=mode=overlap | kea-opt -kea-tile | FileCheck %s --check-prefix=REVALIDATE
 //
 //===----------------------------------------------------------------------===//
 // REGRESSION: Rule D on a program whose weight tiles have to rotate

@@ -171,14 +171,14 @@
 //===--------------------------------------------------------------------===//
 
 // TILEFIT-LABEL: func.func @mobilenet_v2_inverted_residual
-// TILEFIT-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2336 : i64, spm_w = 896 : i64, taps = 16 : i64},
-// TILEFIT-SAME: {acc = 2048 : i64, channels = 32 : i64, layer = 1 : i64, oh = 8 : i64, op = "kea.dwconv2d", ow = 8 : i64, spm_a = 5280 : i64, spm_w = 672 : i64, taps = 9 : i64},
-// TILEFIT-SAME: {acc = 1024 : i64, cycles = {{[0-9]+}} : i64, layer = 2 : i64, oc_groups = 1 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2592 : i64, spm_w = 704 : i64, taps = 32 : i64}]
+// TILEFIT-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2336 : i64, spm_w = 896 : i64, taps = 16 : i64},
+// TILEFIT-SAME: {acc = 2048 : i64, channels = 32 : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 1 : i64, oh = 8 : i64, op = "kea.dwconv2d", ow = 8 : i64, spm_a = 5280 : i64, spm_w = 672 : i64, taps = 9 : i64},
+// TILEFIT-SAME: {acc = 1024 : i64, cycles = {{[0-9]+}} : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 2 : i64, oc_groups = 1 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2592 : i64, spm_w = 704 : i64, taps = 32 : i64}]
 
 // TILEFIT-LABEL: func.func @mobilenet_v2_inverted_residual_stride2
-// TILEFIT-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2336 : i64, spm_w = 896 : i64, taps = 16 : i64},
-// TILEFIT-SAME: {acc = 512 : i64, channels = 32 : i64, layer = 1 : i64, oh = 4 : i64, op = "kea.dwconv2d", ow = 4 : i64, spm_a = 3136 : i64, spm_w = 672 : i64, taps = 9 : i64},
-// TILEFIT-SAME: {acc = 256 : i64, cycles = {{[0-9]+}} : i64, layer = 2 : i64, oc_groups = 1 : i64, oh = 4 : i64, op = "kea.conv2d", ow = 4 : i64, spm_a = 672 : i64, spm_w = 704 : i64, taps = 32 : i64}]
+// TILEFIT-SAME: kea.tiling = [{acc = 2048 : i64, cycles = {{[0-9]+}} : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 0 : i64, oc_groups = 2 : i64, oh = 8 : i64, op = "kea.conv2d", ow = 8 : i64, spm_a = 2336 : i64, spm_w = 896 : i64, taps = 16 : i64},
+// TILEFIT-SAME: {acc = 512 : i64, channels = 32 : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 1 : i64, oh = 4 : i64, op = "kea.dwconv2d", ow = 4 : i64, spm_a = 3136 : i64, spm_w = 672 : i64, taps = 9 : i64},
+// TILEFIT-SAME: {acc = 256 : i64, cycles = {{[0-9]+}} : i64, dram = {{[0-9]+}} : i64, instrs = {{[0-9]+}} : i64, layer = 2 : i64, oc_groups = 1 : i64, oh = 4 : i64, op = "kea.conv2d", ow = 4 : i64, spm_a = 672 : i64, spm_w = 704 : i64, taps = 32 : i64}]
 
 // The stride-2 depthwise: 8x8 -> 4x4 with pad [0,1,0,1].
 // L2-LABEL: func.func @mobilenet_v2_inverted_residual_stride2

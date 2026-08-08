@@ -30,7 +30,7 @@
 // nothing was traded away -- the budget never became binding.
 
 // CHECK-LABEL: func.func @fits_easily
-// CHECK-SAME: kea.imem = {budget = 200 : i64, cycles = {{[0-9]+}} : i64, cycles_unconstrained = {{[0-9]+}} : i64, emitted = 20 : i64, planned = 19 : i64, price = 0.000000e+00 : f64, smallest = {{[0-9]+}} : i64}
+// CHECK-SAME: kea.imem = {budget = 200 : i64, cycles = {{[0-9]+}} : i64, cycles_unconstrained = {{[0-9]+}} : i64, dram = {{[0-9]+}} : i64, dram_unconstrained = {{[0-9]+}} : i64, emitted = 20 : i64, planned = 19 : i64, price = 0.000000e+00 : f64, smallest = {{[0-9]+}} : i64}
 //
 // `emitted` counts what the lowering actually produced and `planned` what the
 // instruction model predicted; they differ by exactly the ops the model does

@@ -240,3 +240,23 @@ func.func @matmul_activation_rhs(%a: tensor<1x8x16xi8>, %b: tensor<1x16x32xi8>)
     : (tensor<1x8x16xi8>, tensor<1x16x32xi8>) -> tensor<1x8x32xi8>
   return %0 : tensor<1x8x32xi8>
 }
+
+// -----
+
+//===--------------------------------------------------------------------===//
+// A rescale of an i32 accumulator
+//===--------------------------------------------------------------------===//
+//
+// An int8 -> int8 rescale lowers (identity MATMUL into ACC, then VQUANT), but
+// an i32 operand is an accumulator that never left ACC, and there is no way to
+// put one back: DMA cannot reach ACC and neither can VCOPY (ISA.md §10.4). It
+// has to be fused into whatever produced it.
+
+func.func @rescale_from_i32(%x: tensor<1x1x1x64xi32>) -> tensor<1x1x1x64xi8> {
+  // expected-error @+1 {{only an int8 -> int8 rescale is lowered}}
+  %0 = kea.rescale %x {quant = #kea.quant<multiplier = [1073741824],
+        shift = [36], input_zp = 0, output_zp = -128, axis = -1,
+        rounding = DOUBLE>}
+    : (tensor<1x1x1x64xi32>) -> tensor<1x1x1x64xi8>
+  return %0 : tensor<1x1x1x64xi8>
+}

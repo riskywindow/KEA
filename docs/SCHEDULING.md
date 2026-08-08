@@ -48,16 +48,19 @@ no overlap                   loads hoisted, stores sunk
    run concurrently with one of its users. That is the whole of ADR-0002's
    soundness obligation, discharged.
 6. Re-stamp the live ranges, re-run `verifyWeightBanks()`, re-prove Rule D.
-7. And, in `mode=auto`, do 2–6 a second time for a plan that does *not* reorder,
-   and emit whichever of the two the model says is cheaper (§9). Reordering has
-   a cost, and on a program with no room to double buffer it is the only thing
-   left.
+7. Check that regions on one queue do not interleave, so per-layer accounting
+   stays partitionable (§7).
+8. And, in `mode=auto`, do 2–7 a second time for a plan that does *not* reorder,
+   and emit the reordered one only if it is predicted to beat that by a margin —
+   otherwise emit nothing at all and leave `-kea-tile`'s program alone (§9).
 
 ```bash
 kea-opt in.mlir -kea-schedule                        # mode=auto: §9
 kea-opt in.mlir -kea-schedule=report-schedule=true   # publish kea.schedule
 kea-opt in.mlir -kea-schedule=mode=overlap           # always reorder
-kea-opt in.mlir -kea-schedule=mode=serial            # never -- the A/B baseline
+kea-opt in.mlir -kea-schedule=mode=serial            # never -- a measurement control
+kea-opt in.mlir -kea-schedule=decline-margin=0       # reorder on any predicted win
+kea-opt in.mlir -kea-schedule=region-lookahead=4     # run further ahead, §4.3
 kea-opt in.mlir -kea-schedule=fragmentation-margin=0 # spend the whole SPM, §6.3
 kea-opt in.mlir "-kea-schedule=queue-depth=2 report-schedule=true"
 kea-opt in.mlir -kea-schedule=annotate-units=false   # drop the kea.unit stamps
@@ -115,7 +118,12 @@ MXU 609k), balancing split a stream that had nothing to overlap with, doubled
 every transfer's data-phase latency, and lengthened the `DMA → MXU → VPU → DMA`
 critical chain:
 
-| 28-convolution prefix, `--spm-reserve 1` | cycles |
+These are historical figures, taken on a 28-convolution prefix when
+`spm-reserve-factor` was still the knob that set tile sizes. They are kept
+because they are why the policy is what it is; the current whole-network numbers
+are in §8.1.1.
+
+| 28-convolution prefix (historical) | cycles |
 |---|---:|
 | not scheduled | 2,130,318 |
 | scheduled, balancing across both engines | 2,246,180 |
@@ -224,6 +232,22 @@ what closes the gap.
 
 ---
 
+### 4.3 Region locality
+
+An instruction may not be emitted more than `region-lookahead` (default 1)
+`kea.trace` regions — layers, in practice — ahead of the oldest region that
+still has unemitted work. Prefetching the *next* layer's weights is where the
+cross-layer win comes from; prefetching the twentieth layer's 20-byte
+`addparams` block is not. Left unbounded the scheduler did exactly that, which
+cost nothing in cycles but held a scratchpad buffer live for the whole program
+and dragged that layer's `TRACE` marker to the top of the stream with it (§7).
+
+Measured on the MobileNetV2 feature extractor the bound is free — 3,176,072
+cycles at lookahead 1 against 3,176,060 at lookahead 999 — so it is on by
+default. It also makes §7's per-queue marker placement robust: a region's
+instructions on its own queue cannot be separated by more than one region's
+worth of other work, so regions on one queue cannot interleave.
+
 ## 5. Semaphores, and why Rule D is structural
 
 ### 5.1 Events are token channels
@@ -287,8 +311,9 @@ use.
 **It has fired, once, and the argument above was wrong in exactly one place.**
 Every lowerable prefix of MobileNetV2 at or beyond node 99 failed it, while the
 same prefix without `--schedule` compiled cleanly, and the threshold moved with
-`spm-reserve-factor` (`demo/regress/run_regressions.sh` case 3 — since fixed). Program length, not
-any particular layer. The mechanism, in three steps:
+whatever changed the tile sizes — at the time, `spm-reserve-factor`
+(`demo/regress/run_regressions.sh` case 3, since fixed). Program length, not any
+particular layer. The mechanism, in three steps:
 
 1. §6.2's rotation edges are added *inside* the capacity fixpoint, after the
    dependence graph was built — and **the last user of an SPM_W weight tile is a
@@ -383,7 +408,7 @@ them. ∎
 It is also tight enough to be useful: happens-before is dense in a real program
 (a tile's DMA is ordered before the compute that consumes it, which is ordered
 before the requantize), so lo(*b*) typically reaches back exactly one tile —
-precisely the window `spm-reserve-factor = 2` was sized for.
+precisely the window a scratchpad with room for two tile sets provides.
 
 `compiler/test/kea-schedule-aliasing.mlir` is the test that would catch a
 violation. It runs `-kea-alloc` on the *unscheduled* two-tile program and pins
@@ -456,7 +481,7 @@ Set it to 0 if you know your program fits.
 
 ---
 
-## 7. Regions
+## 7. Regions — and why the markers cannot be allowed to float
 
 `kea.trace` is queue-agnostic, so its unit is part of its meaning. Both markers
 of a region go on the queue that does the region's arithmetic — MXU if it has
@@ -464,23 +489,50 @@ any `kea.mm`, else DWU, else VPU — because errata E4 says a `REGION_END` keeps
 accumulating until the *issuing* unit's pipeline drains, and that is only the
 honest attribution if the issuing unit is the one doing the work.
 
-The markers bracket the region's instructions **on that queue**, not across all
-of them. Bracketing across every queue sounds more faithful — SIMULATOR.md §5
-does say a region's counters cover every unit's activity in its window, so a
-layer should own the DMA that feeds it — but it does not survive software
-pipelining. A weight prefetch hoisted twenty layers early opens that layer's
-region twenty layers early, and on a 28-convolution program every region then
-spans almost the whole run: measured, 29 regions summing to **41.9M cycles
-inside a 2.24M-cycle program**. That is not attribution, it is noise, and it
-made the per-layer numbers in a scheduled build meaningless.
+**The markers bracket that queue's instructions, not every queue's**, and that
+distinction is the difference between a usable per-layer roofline and noise.
 
-Bracketing on the region's own queue keeps each window to roughly its own layer.
-Work hoisted out of a layer is then attributed to whatever was executing when it
-actually ran, which is the standard convention for pipelined code and the one
-errata E4 already describes for a single pipeline depth. Consecutive regions can
-still overlap by more than that; read a per-layer roofline with it in mind.
+A `kea.trace` has no operands. Nothing in the dependence graph holds it
+anywhere, so it is *placed*, and the obvious placement — before the earliest
+stream position of anything in its region — makes it follow whatever floated
+furthest. Something always does: a residual layer's 20-byte `addparams` DMA
+depends on nothing at all, so the list scheduler issued it in the first hundred
+instructions and the marker went with it. Measured on the MobileNetV2 feature
+extractor: **11 of 52 region-begin markers opened inside the first 100 of 30,430
+instructions, and the 52 regions summed to 23.6M cycles inside a 3.18M-cycle
+program** — a 7.4× over-count, and a per-layer roofline that had to be taken
+from the unscheduled build instead.
 
----
+Two changes fix it, and they are independent:
+
+1. **Keying the markers on the region's own queue** (`locateRegions()`). Work
+   hoisted out of a layer is then attributed to whatever was executing when it
+   actually ran, which is the standard convention for pipelined code and the one
+   errata E4 already describes for a single pipeline depth. `REGION_END` is
+   untouched: it still sits after the last instruction of the region on that
+   queue, so E4's "retires immediately, keeps accumulating until the unit
+   drains" semantics are preserved exactly.
+2. **The region locality bound** (§4.3), which stops the underlying silliness
+   rather than papering over it: that `addparams` DMA is now issued next to its
+   own layer instead of 30,000 instructions early, where it held a scratchpad
+   buffer live for the entire program for no benefit.
+
+| MobileNetV2 feature extractor, 52 regions | Σ region cycles / total cycles |
+|---|---:|
+| unscheduled | 1.07 |
+| scheduled, markers keyed on every queue | **7.43** |
+| scheduled, markers keyed on the region's queue | **1.07** |
+
+The scheduled build is now exactly as sound as the unscheduled one. The residual
+7% is not an error: it is genuine cross-queue overlap between consecutive layers,
+which errata E4 sanctions and which a per-layer roofline should show.
+
+`checkRegions()` proves the structural property this rests on before the pass
+returns: **regions on one queue must not interleave.** `kea-sim` nests regions
+per `(unit, tag)`, so two windows that overlap without nesting double-count the
+overlap instead of partitioning it. Markers on the arithmetic queue plus §4.3's
+locality bound make interleaving impossible; the check is there because "impossible"
+should be verified, not asserted.
 
 ## 8. Measured
 
@@ -512,6 +564,10 @@ python3 compiler/test/kea-schedule-measure.py \
 
 ### 8.1 Headline
 
+All figures below are `kea-sim`'s `total_cycles`. The multi-layer ones are at
+the defaults; the single-layer ones use `mode=overlap` so they measure the
+reordering rather than the decision to reorder (§9).
+
 | program | shape | unscheduled | scheduled | **speedup** |
 |---|---|---:|---:|---:|
 | `@pointwise_64_to_16` | 1×1 conv 64→16, 64², 4 spatial tiles, DMA/compute balanced | 58,070 | **36,190** | **1.605×** |
@@ -523,43 +579,59 @@ All cycle counts are `kea-sim`'s `total_cycles`, at the default
 1.756× and 1.511×. `sim/tests/test_timing.cpp` gets 1.709× on a hand-written
 double-buffered program.
 
-### 8.1.1 Multi-layer, and the one number that matters most
+### 8.1.1 Multi-layer — the numbers that matter most
 
 The single-layer numbers above are each their own program: every one pays a cold
-start and none overlaps a neighbour. The multi-layer measurement is the honest
-one, and it says something the per-layer numbers do not.
+start and none overlaps a neighbour. The multi-layer measurements are the honest
+ones. All of these are at the **defaults** — no flags — with `-kea-tile`
+IMEM-aware and `spm-reserve-factor` at 1.
 
-| MobileNetV2 nodes 0..97, 28 convolutions | unscheduled | scheduled | speedup |
-|---|---:|---:|---:|
-| `--spm-reserve 1` | 2,130,318 | 2,126,037 | 1.002× |
-| `--spm-reserve 2` | 2,201,600 | **1,483,744** | **1.484×** |
-| `--spm-reserve 3` | 2,264,164 | **1,381,050** | **1.639×** |
-| whole feature extractor (0..178, 52 convolutions), reserve 1 | 3,231,748 | 3,226,230 | 1.002× |
+| MobileNetV2 feature extractor, nodes 0..178, 52 convolutions | cycles |
+|---|---:|
+| unscheduled | 3,727,589 |
+| scheduled | **3,176,072** |
+| **speedup** | **1.174×** |
 
-**Best unscheduled build, any reserve factor: 2,130,318. Best scheduled build:
-1,381,050. That is 1.543× on the real program**, and it is the number to quote.
+DMA1 goes from 0% busy to 27.7%, DRAM traffic is unchanged, and the 52 TRACE
+regions sum to 1.07× the program's cycles in both builds (§7).
 
-**`--spm-reserve 1` is the configuration in which the scheduler cannot win, and
-that is not a defect in the scheduler.** DIALECT_L2.md §8 says so outright: a
-reserve factor of 1 "produces the largest tiles and a program that cannot be
-double buffered". Concretely, at reserve 1 `-kea-tile` sizes one tile set to
-fill the whole scratchpad, two consecutive SPM_A buffers do not fit together,
-§6.2's buffers-in-flight bound is 1 for SPM_A and for ACC before the fixpoint
-even starts, and the strict handoff it then needs is *more* ordering than the
-unscheduled program has. There is nothing left to overlap and the soundness
-obligation is pure cost. An earlier build measured that directly: 2,130,318 →
-2,264,218, a 6% regression.
+**On the reported number.** 1.174× is `3,727,589 / 3,176,072` at
+`imem-budget=20480`. An earlier draft of this document said 1.181×; that is
+`3,696,622 / 3,129,389` at `imem-budget=20200`, which is a *different tiling*,
+not a different division of the same counts. Both are real; the one to quote is
+the one at the defaults the demo runs, which is 1.174×.
 
-So the pass does not do it. `mode=auto` (§9) costs the reordered plan and the
-in-order plan with the same model and emits the cheaper one; at reserve 1 it
-emits the in-order plan, which is why the two rows above read 1.002× instead of
-0.94×. The 0.2% it does gain is its minimal-sync analysis being slightly tighter
-than the emitter's.
+#### The budget curve, and why the tight end used to regress
 
-The demo is pinned to `--spm-reserve 1` only because the whole feature extractor
-overruns IMEM at reserve 2 (`demo/regress/run_regressions.sh` case 4 — since fixed, a `-kea-tile`
-instruction-count problem). **Fixing that unlocks the 1.5× on the whole
-network**; it is the single highest-value item left in the backend.
+`-kea-tile`'s instruction budget changes the tiling, and the tiling is what
+decides whether there is anything to overlap. Measured across the feasible
+window:
+
+| `imem-budget` | unscheduled | scheduled | speedup | plan |
+|---|---:|---:|---:|---|
+| 19,100 | 3,721,080 | 3,721,080 | **1.000×** | declined |
+| 19,500 | 3,665,429 | 3,665,429 | **1.000×** | declined |
+| 20,200 | 3,696,622 | 3,129,389 | 1.181× | overlap |
+| 20,480 (default) | 3,727,589 | 3,176,072 | **1.174×** | overlap |
+| 21,300 | 3,649,751 | 3,179,786 | 1.148× | overlap |
+
+At the two tightest budgets the tiler coarsens until an activation tile fills
+SPM_A, `buffers_in_flight` for SPM_A is 1 before the capacity fixpoint even
+starts, and there is nothing to double buffer — the same condition
+DIALECT_L2.md §8 describes for `spm-reserve-factor=1`. Reordering there is pure
+cost, and an earlier build measured it as such: **0.941×, a 6% regression.**
+
+That is now 1.000×, exactly, because the pass declines and emits nothing at all
+(§9), so the program is byte-identical to the unscheduled one. Two things had to
+change for `auto` to see it:
+
+* the in-order plan it compares against no longer carries §6.2's rotation edges,
+  which it does not need — charging it for them made the estimate up to **8.2%
+  pessimistic** (4,027,365 modelled against 3,721,080 measured), which was
+  enough to make a plan that was really 6% worse look 0.8% better. It is now
+  within 0.6% (3,745,218 against 3,721,080);
+* the overlapped plan must clear a 5% margin, not merely win, because a 1%
+  predicted difference is inside the model's error.
 
 ### 8.2 Per-unit breakdown — `@pointwise_64_to_16`
 
@@ -660,36 +732,53 @@ error cannot flip the decision.
 
 ---
 
-## 9. `mode=auto`: when the pass declines, and whether `--schedule` should be on
+## 9. `mode=auto`: what it guarantees, and against which baseline
 
 Reordering is not free. §6's soundness obligation is discharged with real
 dependence edges, and on a program with no room to double buffer those edges are
-pure cost. So the default mode costs both plans with the same model and emits
-the cheaper one:
+pure cost. So the default costs two plans with one cost model and emits the
+cheaper:
 
 | mode | what it emits |
 |---|---|
-| `auto` (default) | the cheaper of the two, by modelled cycles; falls back further if neither fits |
-| `overlap` | always the reordered plan |
-| `serial` | never reorders, synchronizes every cross-queue adjacency — the A/B control §8 measures against |
+| `auto` (default) | the overlapped plan if it beats the in-order one by `decline-margin` percent (default 5); otherwise **nothing at all** |
+| `overlap` | always the reordered plan, falling back to `serial` if it is not placeable |
+| `serial` | never reorders and synchronizes every cross-queue adjacency — a measurement control, not a strategy |
 
-The in-order plan is a faithful model of what the backend emits *without* this
-pass: `-kea-tile`'s order, one engine, minimal storage-derived sync — the same
-thing `kea-translate --sync=auto` inserts. Costing it with the same cost model
-is what makes the comparison meaningful.
+**The baseline is the in-order plan, which models not scheduling at all** —
+`-kea-tile`'s order, one DMA engine, minimal sync, no rotation edges, no widened
+live ranges. It is deliberately *not* `mode=serial`: that one puts a handshake at
+every cross-queue adjacency and measures **4,063,835 cycles on the feature
+extractor, 9% slower than not scheduling**, so beating it would guarantee
+nothing. Costing the in-order plan with the same cost model as the overlapped
+one is what makes the comparison mean something, and it is accurate — within
+0.6% of the measured unscheduled build at the budget where the decision is
+closest.
 
-`auto` also enforces that the plan it emits is *placeable*. A plan whose widened
-ranges `-kea-alloc` provably cannot place is rejected in favour of the in-order
-one, and if neither fits, of `serial` — which always fits, because nothing in it
-is concurrent and every range is the one `-kea-tile` sized. Turning this pass's
-aggressiveness into the next pass's failure is not an acceptable outcome.
+**Declining means emitting nothing.** No reordering, no rotation edges, no
+widened ranges, no `unit` attributes, no semaphores. `-kea-emit` then derives its
+semaphores from post-allocation storage intervals exactly as it does without
+`--schedule`, and `-kea-alloc` packs `-kea-tile`'s own ranges — so the output is
+byte-identical to the unscheduled build. A pass that has decided not to help must
+not still charge for the attempt; that is what turns the guarantee from "usually
+better" into an exact 1.000× on the programs it declines.
 
-**Should `--schedule` be on by default? Yes — with `mode=auto`, and with
-`--spm-reserve` at 2 or more.** With `auto` the pass cannot lose: it is worth
-1.5× where there is room to double buffer, and it declines where there is not,
-costing nothing measurable (1.002× on both multi-layer programs at reserve 1).
-Without `auto` — i.e. `mode=overlap` — it should *not* be on by default, because
-at `--spm-reserve 1` it costs 6%.
+So, precisely:
+
+> **`mode=auto` guarantees that `--schedule` produces either a program its cost
+> model predicts is at least 5% faster than not scheduling, or the identical
+> program you would have got without it.** What it does not guarantee is that
+> the prediction is right; the model's error is ~1% on the multi-layer programs
+> measured here (§8.5), and the 5% margin is sized against that.
+
+`auto` also enforces placeability: a plan whose widened ranges `-kea-alloc`
+provably cannot place is never emitted, and if the overlapped plan is
+unplaceable under `mode=overlap`, `serial` — which always fits — is emitted
+instead.
+
+**Should `--schedule` be on by default? Yes, with `mode=auto`.** It is worth
+1.17× on the whole feature extractor at the defaults, up to 1.6× on layers with
+room to double buffer, and exactly 1.000× where there is none.
 
 ## 10. What is not implemented, and what this pass found
 
@@ -704,11 +793,15 @@ Stated plainly rather than stubbed.
   some MXU stalls; it would also have to re-derive `accumulate`, and the payoff
   is small because the MXU queue is already dense.
 * **The queue model does not simulate head-of-line blocking.** §4.1.
-* **The IMEM ceiling is what is costing the whole-network speedup.** §8.1.1: at
-  `--spm-reserve 1` the scheduler correctly declines, and at 2 or 3 it is worth
-  1.48–1.64× — but the whole feature extractor only fits in IMEM at reserve 1
-  (`demo/regress/run_regressions.sh` case 4 — since fixed). **The fix belongs in `-kea-tile`**, and
-  it is the highest-value item left in the backend.
+* **The instruction budget and the schedule are coupled, and nothing negotiates
+  between them.** §8.1.1's curve is not monotonic: `-kea-tile` chooses a tiling
+  against an IMEM budget without knowing whether that tiling leaves the
+  scheduler anything to overlap, and below about 19,500 instructions it chooses
+  one that does not. The scheduler then correctly declines, and the program ends
+  up ~18% slower than it is 1,000 instructions of budget further up. Neither
+  pass is wrong on its own terms; the search that would fix it — choosing the
+  budget by what the *scheduled* program costs — spans both and belongs to
+  neither. Today the demo finds the optimum by sweeping.
 * **Regions overlap after software pipelining.** §7. Bounded now, but still
   worth knowing before reading a per-layer roofline.
 * **The fit predicate is `maxlive`, not the allocator's own packing.** §6.3

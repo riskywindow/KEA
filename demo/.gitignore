@@ -1,0 +1,3 @@
+# Compiler/simulator intermediates. Regenerate with demo/run_all.sh.
+build/
+__pycache__/

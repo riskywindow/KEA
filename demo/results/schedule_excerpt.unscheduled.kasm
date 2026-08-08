@@ -1,0 +1,184 @@
+.arch "KEA-1"
+.isa_revision 1
+.entry 0
+
+.event 0, "VPU_to_DMA0"
+.event 1, "DMA0_to_MXU"
+.event 2, "VPU_to_MXU"
+.event 3, "MXU_to_VPU"
+.event 4, "DMA0_to_VPU"
+.event 5, "MXU_to_DMA0"
+.region 0, "slice_6_7.0"
+
+layer0:
+  MXU   TRACE   kind=begin, tag=0, payload=0
+  DMA0  DMA_LD  spm_space=SPM_W, dram_addr=@slice_6_7.0.weights, spm_addr=w:0, len0=512, n1=1, n2=1, dram_s1=512, dram_s2=0, spm_s1=512, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  DMA_LD  spm_space=SPM_W, dram_addr=@slice_6_7.0.qparams, spm_addr=w:512, len0=192, n1=1, n2=1, dram_s1=192, dram_s2=192, spm_s1=192, spm_s2=192
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  SIGNAL  event=4, inc=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  MXU   SIGNAL  event=5, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=5, threshold=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+57344, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  SIGNAL  event=4, inc=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  MXU   SIGNAL  event=5, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+28672, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=5, threshold=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+114688, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  SIGNAL  event=4, inc=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  MXU   SIGNAL  event=5, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+57344, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=5, threshold=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+172032, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  SIGNAL  event=4, inc=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  MXU   SIGNAL  event=5, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+86016, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=5, threshold=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+229376, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  SIGNAL  event=4, inc=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  MXU   SIGNAL  event=5, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+114688, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=5, threshold=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+286720, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  DMA0  SIGNAL  event=4, inc=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  MXU   SIGNAL  event=5, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+143360, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  DMA0  SIGNAL  event=4, inc=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=57360, rows=1, src_row_stride=0, dst_row_stride=57360, fill_value=-128
+  VPU   SIGNAL  event=2, inc=1
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=5, threshold=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+344064, spm_addr=a:0, len0=3584, n1=16, n2=1, dram_s1=3584, dram_s2=0, spm_s1=3584, spm_s2=0
+  DMA0  SIGNAL  event=1, inc=1
+  MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   WAIT    event=2, threshold=1
+  MXU   WAIT    event=1, threshold=1
+  MXU   MATMUL  a_addr=a:0, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=0, acc_mode=overwrite, dtype=int8
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:16, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=16, acc_addr=acc:0, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=3, inc=1
+  VPU   WAIT    event=3, threshold=1
+  VPU   WAIT    event=4, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:57360, qparam_addr=w:512, num_pixels=1792, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   SIGNAL  event=0, inc=1
+  DMA0  WAIT    event=0, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+172032, spm_addr=a:57360, len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
+  MXU   TRACE   kind=end, tag=0, payload=0
+  CTRL  HALT    exit_code=0

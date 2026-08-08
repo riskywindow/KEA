@@ -1,0 +1,153 @@
+{
+ "golden_npz": "frontend/testdata/golden_io_mobilenetv2_int8.npz",
+ "vectors": [
+  {
+   "index": 0,
+   "features": {
+    "tensor": "head",
+    "elements": 62720,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "pool_on_host": {
+    "tensor": "gap(host)",
+    "elements": 1280,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "classifier_given_reference_pool": {
+    "tensor": "fc|ref gap",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "end_to_end": {
+    "tensor": "fc(e2e)",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "argmax_golden": 0,
+   "argmax_sim": 0,
+   "argmax_agrees": true
+  },
+  {
+   "index": 1,
+   "features": {
+    "tensor": "head",
+    "elements": 62720,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "pool_on_host": {
+    "tensor": "gap(host)",
+    "elements": 1280,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "classifier_given_reference_pool": {
+    "tensor": "fc|ref gap",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "end_to_end": {
+    "tensor": "fc(e2e)",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "argmax_golden": 491,
+   "argmax_sim": 491,
+   "argmax_agrees": true
+  },
+  {
+   "index": 2,
+   "features": {
+    "tensor": "head",
+    "elements": 62720,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "pool_on_host": {
+    "tensor": "gap(host)",
+    "elements": 1280,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "classifier_given_reference_pool": {
+    "tensor": "fc|ref gap",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "end_to_end": {
+    "tensor": "fc(e2e)",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "argmax_golden": 497,
+   "argmax_sim": 497,
+   "argmax_agrees": true
+  },
+  {
+   "index": 3,
+   "features": {
+    "tensor": "head",
+    "elements": 62720,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "pool_on_host": {
+    "tensor": "gap(host)",
+    "elements": 1280,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "classifier_given_reference_pool": {
+    "tensor": "fc|ref gap",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "end_to_end": {
+    "tensor": "fc(e2e)",
+    "elements": 1000,
+    "mismatches": 0,
+    "max_abs_diff": 0,
+    "exact": true
+   },
+   "argmax_golden": 495,
+   "argmax_sim": 495,
+   "argmax_agrees": true
+  }
+ ],
+ "strict_checks": {
+  "features": true,
+  "classifier": true
+ },
+ "summary": {
+  "vectors": 4,
+  "features_exact": true,
+  "classifier_exact": true,
+  "end_to_end_exact": true,
+  "argmax_agreement": 4,
+  "caveat": "the global average pool runs on the host with the frontend's reference kernel; it does not compile for the NPU (see docs/RESULTS.md)"
+ }
+}

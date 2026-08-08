@@ -54,12 +54,13 @@ any future pybind/ctypes interop.
 | torchvision | 0.17.2 | supplies MobileNetV2 + pretrained weights |
 | onnx | 1.22.0 | |
 | numpy | **1.26.4** | pinned `<2`; torch 2.2.2 is built against the NumPy 1.x C API and fails with `_ARRAY_API not found` on NumPy 2 |
+| matplotlib | 3.11.1 | **only** for `demo/roofline.py`'s plot; nothing in `frontend/`, `compiler/` or `sim/` imports it |
 
 Recreate with:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install torch torchvision onnx pillow "numpy<2"
+.venv/bin/pip install torch torchvision onnx pillow "numpy<2" matplotlib
 ```
 
 Always invoke as `.venv/bin/python`, never a bare `python3` — the system

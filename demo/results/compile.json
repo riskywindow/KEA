@@ -1,0 +1,51 @@
+{
+ "kgraph": "models/mobilenetv2_int8.kgraph.json",
+ "nodes_total": 183,
+ "imem_capacity": 32768,
+ "attempts": [
+  {
+   "label": "whole graph (183 nodes)",
+   "ok": false,
+   "returncode": 1,
+   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_full.tosa.mlir:1148:10: error: 'kea.rescale' op has no Level 2 lowering. -kea-tile lowers kea.conv2d, kea.dwconv2d, kea.matmul, kea.fully_connected, kea.pool, quantized kea.add and kea.reshape; kea.rescale, kea.clamp and kea.transpose must be eliminated by -kea-fuse (KEA-1 has no transpose unit and no way to rescale a tensor that never entered ACC).",
+   "nodes": 183
+  },
+  {
+   "label": "features, --spm-reserve 2",
+   "ok": false,
+   "returncode": 1,
+   "instructions": 41409,
+   "error": "/Users/rishivinodkumar/npu/demo/build/features_r2.kasm:32886:9: error: program exceeds IMEM: more than 32768 instructions",
+   "nodes": 179,
+   "spm_reserve": 2,
+   "fits_imem": false
+  },
+  {
+   "label": "features, --spm-reserve 1",
+   "ok": true,
+   "returncode": 0,
+   "instructions": 30773,
+   "nodes": 179,
+   "spm_reserve": 1,
+   "fits_imem": true
+  },
+  {
+   "label": "classifier (3 nodes)",
+   "ok": true,
+   "returncode": 0,
+   "instructions": 10833,
+   "nodes": 3
+  },
+  {
+   "label": "global_avg_pool (1 node)",
+   "ok": false,
+   "returncode": 1,
+   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_pool.tosa.mlir:15:10: error: 'kea.rescale' op has no Level 2 lowering. -kea-tile lowers kea.conv2d, kea.dwconv2d, kea.matmul, kea.fully_connected, kea.pool, quantized kea.add and kea.reshape; kea.rescale, kea.clamp and kea.transpose must be eliminated by -kea-fuse (KEA-1 has no transpose unit and no way to rescale a tensor that never entered ACC).",
+   "nodes": 1
+  }
+ ],
+ "full_graph_mlir_roundtrip": true,
+ "full_graph_mlir_bytes": 7436599,
+ "nodes_compiled": 182,
+ "fraction_of_graph": 0.994535519125683
+}

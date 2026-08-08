@@ -17,6 +17,7 @@ frontend/
     builder.py       dual-backend graph builder (calibrate / emit)
     nets.py          MobileNetV2 extraction + the tiny ViT
     onnx_ingest.py   ONNX -> KGraph
+    tosa_emit.py     KGraph -> TOSA MLIR for MLIR 20.1.6 (section 5)
     pipeline.py      calibrate-then-emit driver
     data.py          Imagenette loading / preprocessing
   export_mobilenetv2.py     end-to-end MobileNetV2 + accuracy measurement
@@ -28,7 +29,7 @@ frontend/
 ```
 
 Run everything with `.venv/bin/python` after `source scripts/env.sh`.
-Tests: `.venv/bin/python -m pytest frontend/tests` (74 tests, ~16 s).
+Tests: `.venv/bin/python -m pytest frontend/tests` (92 tests, ~24 s).
 
 **Added to the venv by this component:** `pytest` (9.1.1) and its dependencies
 (`pluggy`, `iniconfig`, `packaging`, `pygments`). Nothing else; the frontend
@@ -351,6 +352,20 @@ The IR was designed against the verified behaviour in `docs/TOSA_NOTES.md`
 (MLIR 20.1.6), so a `tosa` / `kea` dialect emitter is a mechanical walk with no
 redesign. Zero points are attributes on 20.1.6, not operands.
 
+**Implemented** in `kea_frontend/tosa_emit.py`, tested in
+`tests/test_tosa_emit.py` (every emitted fixture is gated through `mlir-opt`,
+and several through the whole `kea-opt` / `kea-translate` backend):
+
+```sh
+cd frontend && ../.venv/bin/python -m kea_frontend.tosa_emit \
+    ../models/mobilenetv2_int8.kgraph.json -o /tmp/m.tosa.mlir --function mnv2
+# --first-index / --last-index emit a contiguous node slice as one function
+```
+
+Constants are written in MLIR's hex `dense<"0x…">` byte form; MobileNetV2's
+3.5 MB of weights become 7.4 MB of MLIR rather than ~25 MB of decimal. The
+measured end-to-end outcome is in `docs/RESULTS.md`.
+
 | KEA node | TOSA op | Notes |
 |---|---|---|
 | `conv2d` | `tosa.conv2d` | weights already `OHWI`; `quantization_info = #tosa.conv_quant<input_zp, weight_zp>`; `acc_type = i32` |
@@ -361,7 +376,7 @@ redesign. Zero points are attributes on 20.1.6, not operands.
 | `add` | `tosa.add` | operands are already equal-rank i32 |
 | `clamp` | `tosa.clamp` | `min_int`/`max_int` from the node; **must also emit `min_fp`/`max_fp`** or it will not parse |
 | `avg_pool2d` | `tosa.avg_pool2d` | `#tosa.unary_quant`; KEA forbids padding, so KEA's constant divisor and TOSA's per-position divisor always agree |
-| `global_avg_pool` | `tosa.avg_pool2d` with `kernel = [H, W]` | or a reduce_sum + rescale |
+| `global_avg_pool` | `tosa.avg_pool2d` with `kernel = [H, W]` | **only exact when the folded `multiplier`/`shift` is precisely `1/(H·W)`.** KEA's pool folds an arbitrary requantization; TOSA's can only divide by the window count. The emitter falls back to `avg_pool2d` at the input scale + a `tosa.rescale`, records it in the file it writes, and says it is not bit-exact. MobileNetV2's head needs this (its pool also changes scale by 1.3885×) |
 | `reshape` | `tosa.reshape` | `new_shape` is a `DenseI64ArrayAttr` on 20.1.6 |
 | `transpose` | `tosa.transpose` | permutation is an **operand** (rank-1 i32 tensor) on 20.1.6, not an attribute |
 | `concat` | `tosa.concat` | inputs already share scale and zero point |
@@ -551,7 +566,7 @@ in 200.
 ## 10. Tests
 
 ```sh
-.venv/bin/python -m pytest frontend/tests          # 74 tests, ~16 s
+.venv/bin/python -m pytest frontend/tests          # 92 tests, ~24 s
 .venv/bin/python -m pytest frontend/tests -m "not slow"
 ```
 
@@ -561,6 +576,7 @@ in 200.
 | `test_ir_roundtrip.py` | save/load fidelity, byte-stable re-serialization, no bulk data in JSON, and 11 validator rejection cases |
 | `test_reference_ops.py` | every op, integer vs float, bounded in **quantization steps of the output tensor** (RMS *and* max, limits set from measurement with ~2x headroom); `idiv_trunc`; `isqrt` |
 | `test_end_to_end.py` | BN folding exactness; MobileNetV2 int8 vs float; the shipped artifacts; **the golden I/O vectors**; integrality of every intermediate; tiny ViT; ONNX-vs-torch graph equivalence; ONNX rejection paths |
+| `test_tosa_emit.py` | the TOSA emitter (§5): every op fixture gated through `mlir-opt` twice, four of them through the whole `kea-opt`/`kea-translate` backend; the 20.1.6 spellings asserted individually; hex constants decoded back by `mlir-opt`; node-slice closure; the inexact-pool fallback; the whole 183-node MobileNetV2 module |
 
 Measured per-op quantization error (max / RMS, in output quantization steps):
 

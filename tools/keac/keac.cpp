@@ -240,12 +240,15 @@ int main(int argc, char **argv) {
   if (endsWith(input, ".kgraph.json") || endsWith(input, ".json")) {
     std::fprintf(
         stderr,
-        "keac: '%s' looks like a .kgraph.json.\n"
-        "      Ingesting one needs the frontend's TOSA emitter, which does not\n"
-        "      exist yet -- docs/FRONTEND.md section 5 specifies the node-to-op\n"
-        "      mapping and calls it \"a mechanical walk\", but nothing\n"
-        "      implements it. Export TOSA MLIR and pass that instead.\n",
-        input.c_str());
+        "keac: '%s' looks like a .kgraph.json. keac compiles TOSA MLIR; run\n"
+        "      the frontend's emitter first (docs/FRONTEND.md section 5):\n"
+        "\n"
+        "        cd frontend && ../.venv/bin/python -m kea_frontend.tosa_emit \\\n"
+        "            %s -o model.tosa.mlir --function model\n"
+        "\n"
+        "      then pass model.tosa.mlir to keac. Use --first-index/--last-index\n"
+        "      to emit a contiguous node slice as one function.\n",
+        input.c_str(), input.c_str());
     return 2;
   }
 

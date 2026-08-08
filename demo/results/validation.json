@@ -31,9 +31,25 @@
     "max_abs_diff": 0,
     "exact": true
    },
+   "pool_on_npu": {
+    "tensor": "gap(NPU)",
+    "elements": 1280,
+    "mismatches": 417,
+    "max_abs_diff": 1,
+    "exact": false
+   },
+   "end_to_end_all_npu": {
+    "tensor": "fc(all-NPU)",
+    "elements": 1000,
+    "mismatches": 119,
+    "max_abs_diff": 1,
+    "exact": false
+   },
    "argmax_golden": 0,
    "argmax_sim": 0,
-   "argmax_agrees": true
+   "argmax_agrees": true,
+   "argmax_sim_all_npu": 0,
+   "argmax_agrees_all_npu": true
   },
   {
    "index": 1,
@@ -65,9 +81,25 @@
     "max_abs_diff": 0,
     "exact": true
    },
+   "pool_on_npu": {
+    "tensor": "gap(NPU)",
+    "elements": 1280,
+    "mismatches": 436,
+    "max_abs_diff": 1,
+    "exact": false
+   },
+   "end_to_end_all_npu": {
+    "tensor": "fc(all-NPU)",
+    "elements": 1000,
+    "mismatches": 133,
+    "max_abs_diff": 1,
+    "exact": false
+   },
    "argmax_golden": 491,
    "argmax_sim": 491,
-   "argmax_agrees": true
+   "argmax_agrees": true,
+   "argmax_sim_all_npu": 491,
+   "argmax_agrees_all_npu": true
   },
   {
    "index": 2,
@@ -99,9 +131,25 @@
     "max_abs_diff": 0,
     "exact": true
    },
+   "pool_on_npu": {
+    "tensor": "gap(NPU)",
+    "elements": 1280,
+    "mismatches": 380,
+    "max_abs_diff": 1,
+    "exact": false
+   },
+   "end_to_end_all_npu": {
+    "tensor": "fc(all-NPU)",
+    "elements": 1000,
+    "mismatches": 108,
+    "max_abs_diff": 1,
+    "exact": false
+   },
    "argmax_golden": 497,
    "argmax_sim": 497,
-   "argmax_agrees": true
+   "argmax_agrees": true,
+   "argmax_sim_all_npu": 497,
+   "argmax_agrees_all_npu": true
   },
   {
    "index": 3,
@@ -133,13 +181,30 @@
     "max_abs_diff": 0,
     "exact": true
    },
+   "pool_on_npu": {
+    "tensor": "gap(NPU)",
+    "elements": 1280,
+    "mismatches": 427,
+    "max_abs_diff": 1,
+    "exact": false
+   },
+   "end_to_end_all_npu": {
+    "tensor": "fc(all-NPU)",
+    "elements": 1000,
+    "mismatches": 95,
+    "max_abs_diff": 1,
+    "exact": false
+   },
    "argmax_golden": 495,
    "argmax_sim": 495,
-   "argmax_agrees": true
+   "argmax_agrees": true,
+   "argmax_sim_all_npu": 495,
+   "argmax_agrees_all_npu": true
   }
  ],
  "strict_checks": {
   "features": true,
+  "featpool": true,
   "classifier": true
  },
  "summary": {
@@ -148,7 +213,14 @@
   "classifier_exact": true,
   "end_to_end_exact": true,
   "argmax_agreement": 4,
+  "all_npu_exact": false,
+  "all_npu_gap_mismatches": 1660,
+  "all_npu_gap_elements": 5120,
+  "all_npu_fc_mismatches": 455,
+  "all_npu_fc_elements": 4000,
+  "all_npu_max_abs_diff": 1,
+  "all_npu_argmax_agreement": 4,
   "programs": "scheduled builds at the compiler defaults",
-  "caveat": "the global average pool runs on the host with the frontend's reference kernel; its trailing rescale has no Level 2 lowering (see docs/RESULTS.md)"
+  "caveat": "the bit-exact split runs the global average pool on the host; the all-NPU split runs all 183 nodes on the machine but inherits the frontend's avg_pool2d+rescale double rounding (docs/RESULTS.md 1.1)"
  }
 }

@@ -2,28 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Emit TOSA for MobileNetV2 int8 and compile it, recording exactly what fits.
 
-Everything runs at the compiler's **defaults** -- `spm-reserve-factor = 1`,
-`imem-budget = 20480`, `-kea-schedule mode=auto`.  Nothing is pinned.
+Everything runs at the compiler's **defaults**: this script passes no tuning
+flag anywhere except where a step is explicitly about a flag.
 
 Six things are attempted, in this order, and every outcome -- including the
 failures -- is written to ``demo/results/compile.json``:
 
-1. **the whole 183-node graph** as one function.  Fails, twice over: at the
-   default budget the tiler cannot fit it, and at a budget large enough that it
-   can, the ``tosa.rescale`` the emitter puts after the head pool has no Level 2
-   lowering.
-2. **the same graph with that rescale deleted** -- a *structural* probe, not a
-   runnable program, that answers the question the diagnostic leaves open: even
-   at the coarsest tiling of every layer, does MobileNetV2 fit in IMEM at all?
-3. **the 179-node feature extractor** (all 52 convolutions, input -> the last
+1. **the whole 183-node graph** as one function.  Every op in it lowers; it
+   does not fit.  Attempted at the default budget, at the tiler's own
+   coarsest-tiling floor, and at a budget equal to all of IMEM, so the capacity
+   result is measured from three directions rather than assumed.
+2. **the 179-node feature extractor** (all 52 convolutions, input -> the last
    1x1 conv's ReLU6 output), unscheduled and scheduled.
-4. **the 3-node classifier** (reshape + fully_connected + rescale), likewise.
-5. **the head pool as the model actually spells it** (node 179), to show the
-   remaining blocker in isolation.
-6. **a pool with no scale change** (`demo/regress/pool_translates.mlir`), to
-   show that `kea.pool` itself compiles and runs.
+3. **the 180-node feature extractor + head pool** (nodes 0..179).  This is new:
+   a standalone ``kea.rescale`` lowers now, so the pool no longer has to run on
+   the host.  It costs bit-exactness -- see ``demo/validate_mobilenetv2.py``.
+4. **the 3-node classifier** (reshape + fully_connected + rescale), unscheduled
+   and scheduled.
+5. **the head pool as the model actually spells it** (node 179 alone).
+6. **a pool with no scale change** (`demo/regress/pool_translates.mlir`), which
+   is the case that used to be untranslatable.
 
-The scheduled builds are what ships as ``features.keaf`` / ``classifier.keaf``.
+The scheduled builds are what ships as ``features.keaf`` / ``featpool.keaf`` /
+``classifier.keaf``.
 
 Nothing here is estimated.  The instruction counts come from counting
 instruction lines in the ``.kasm`` the compiler actually wrote.
@@ -69,26 +70,6 @@ def attempt(label, mlir, fn, keaf, **kw):
     return rec
 
 
-def strip_pool_rescale(src_path: str, out_path: str) -> bool:
-    """Delete the `tosa.rescale` the emitter appends to the head pool.
-
-    The result is **numerically wrong** -- it drops a 1.3885 scale change -- and
-    is never run.  It exists only so the IMEM question can be answered
-    separately from the lowering question.
-    """
-    src = open(src_path).read()
-    pat = re.compile(r"\n  %gap = tosa\.rescale %gap_pooled \{.*?\n  \} : "
-                     r"\(tensor<1x1x1x1280xi8>\) -> tensor<1x1x1x1280xi8>",
-                     re.S)
-    text, n = pat.subn("", src)
-    if n != 1:
-        return False
-    text = text.replace("tosa.reshape %gap ", "tosa.reshape %gap_pooled ")
-    with open(out_path, "w") as f:
-        f.write(text)
-    return True
-
-
 def floor_from_diagnostic(msg: str):
     """`-kea-tile`'s own number for the coarsest tiling of every layer."""
     m = re.search(r"needs (\d+) instructions against a budget of (\d+)", msg)
@@ -104,8 +85,12 @@ def main() -> int:
     out = {"kgraph": os.path.relpath(C.KGRAPH, C.ROOT),
            "nodes_total": len(g.nodes),
            "imem_capacity": IMEM,
-           "defaults": {"spm_reserve_factor": 1, "imem_budget": 20480,
-                        "kea_schedule_mode": "auto"},
+           # The demo passes no tuning flags at all, so the values in force are
+           # whatever `-kea-tile` / `-kea-schedule` default to. Recorded as
+           # "unset" rather than restated, so this file cannot go stale when a
+           # default moves.
+           "flags": "none: compiler defaults for spm-reserve-factor, "
+                    "imem-budget and -kea-schedule mode",
            "attempts": []}
 
     # ---- 1. the whole graph, at the defaults --------------------------------
@@ -127,43 +112,26 @@ def main() -> int:
     rec["budget"] = budget
     out["attempts"].append(rec)
 
-    # raise the budget past that floor: the tiler now succeeds and the *next*
-    # blocker becomes visible.
-    if need:
-        rec = attempt("whole graph, --imem-budget %d" % need, full,
-                      "mobilenetv2",
-                      os.path.join(C.BUILD, "mobilenetv2_full_big.keaf"),
-                      imem_budget=need)
+    # Raise the budget to the tiler's own floor, and then to all of IMEM: every
+    # op lowers, so what comes back is the real program size, not a proxy.
+    out["capacity"] = {"imem": IMEM,
+                       "coarsest_tiling_budget": need}
+    for b in ([need] if need else []) + [IMEM]:
+        rec = attempt("whole graph, --imem-budget %d" % b, full, "mobilenetv2",
+                      os.path.join(C.BUILD, "full_%d.keaf" % b),
+                      imem_budget=b)
         rec["nodes"] = len(g.nodes)
         out["attempts"].append(rec)
+        if rec.get("instructions") and b == need:
+            out["capacity"]["instructions_at_coarsest_tiling"] = \
+                rec["instructions"]
+            out["capacity"]["over_imem_by"] = rec["instructions"] - IMEM
+            out["capacity"]["over_imem_pct"] = \
+                100.0 * (rec["instructions"] - IMEM) / IMEM
+            out["capacity"]["fits_imem"] = rec["instructions"] <= IMEM
 
-    # ---- 2. does it fit IMEM at all?  a structural probe --------------------
-    print("\n[2] structural probe: the same graph with the pool's trailing\n"
-          "    rescale deleted (NOT numerically valid, never run) -- does\n"
-          "    MobileNetV2 fit in %d instructions at any tiling?" % IMEM)
-    probe = os.path.join(C.BUILD, "mobilenetv2_full_norescale.tosa.mlir")
-    out["structural_probe"] = {"note":
-        "the pool's 1.3885 scale change is deleted; this program is "
-        "numerically wrong and is compiled only to measure program size"}
-    if strip_pool_rescale(full, probe):
-        for b in ([need] if need else []) + [IMEM]:
-            rec = attempt("probe, --imem-budget %d" % b, probe, "mobilenetv2",
-                          os.path.join(C.BUILD, "probe_%d.keaf" % b),
-                          imem_budget=b)
-            rec["nodes"] = len(g.nodes)
-            out["attempts"].append(rec)
-            if rec.get("instructions"):
-                out["structural_probe"]["instructions_at_coarsest_tiling"] = \
-                    rec["instructions"]
-                out["structural_probe"]["over_imem_by"] = \
-                    rec["instructions"] - IMEM
-                out["structural_probe"]["fits_imem"] = \
-                    rec["instructions"] <= IMEM
-    else:
-        print("  skipped: could not find the pool rescale to delete")
-
-    # ---- 3. the feature extractor ------------------------------------------
-    print("\n[3] feature extractor, nodes 0..%d (52 convolutions), defaults"
+    # ---- 2. the feature extractor ------------------------------------------
+    print("\n[2] feature extractor, nodes 0..%d (52 convolutions), defaults"
           % LAST_FEATURE_NODE)
     feat = os.path.join(C.BUILD, "mobilenetv2_features.tosa.mlir")
     C.emit_tosa(feat, "mnv2_features", last=LAST_FEATURE_NODE)
@@ -175,6 +143,22 @@ def main() -> int:
                                    % ("sched" if sched else "unsched")),
                       schedule=sched)
         rec["nodes"] = LAST_FEATURE_NODE + 1
+        rec["fits_imem"] = rec.get("instructions", 1 << 30) <= IMEM
+        out["attempts"].append(rec)
+
+    # ---- 3. the feature extractor WITH the head pool -----------------------
+    print("\n[3] feature extractor + head pool, nodes 0..%d, defaults"
+          % POOL_NODE)
+    featpool = os.path.join(C.BUILD, "mobilenetv2_featpool.tosa.mlir")
+    C.emit_tosa(featpool, "mnv2_featpool", last=POOL_NODE)
+    for sched in (False, True):
+        rec = attempt("features + pool, %s" % ("--schedule" if sched
+                                               else "no --schedule"),
+                      featpool, "mnv2_featpool",
+                      os.path.join(C.BUILD, "featpool_%s.keaf"
+                                   % ("sched" if sched else "unsched")),
+                      schedule=sched)
+        rec["nodes"] = POOL_NODE + 1
         rec["fits_imem"] = rec.get("instructions", 1 << 30) <= IMEM
         out["attempts"].append(rec)
 
@@ -196,13 +180,16 @@ def main() -> int:
 
     # the shipped artifacts are the scheduled builds
     for src, dst in (("features_sched", "features"),
+                     ("featpool_sched", "featpool"),
                      ("classifier_sched", "classifier")):
         for ext in (".keaf", ".kasm", ".map.json", ".weights.bin", ".l2.mlir"):
             p = os.path.join(C.BUILD, src + ext)
             if os.path.exists(p):
                 os.replace(p, os.path.join(C.BUILD, dst + ext))
-    out["shipped"] = {"features.keaf": "nodes 0..178, --schedule, defaults",
-                      "classifier.keaf": "nodes 180..182, --schedule, defaults"}
+    out["shipped"] = {
+        "features.keaf": "nodes 0..178, --schedule, defaults",
+        "featpool.keaf": "nodes 0..179 (pool on the NPU), --schedule, defaults",
+        "classifier.keaf": "nodes 180..182, --schedule, defaults"}
 
     # ---- 5. the head pool, as this model spells it -------------------------
     print("\n[5] the head pool alone (node %d), as the emitter spells it"
@@ -214,8 +201,8 @@ def main() -> int:
     rec["nodes"] = 1
     out["attempts"].append(rec)
 
-    # ---- 6. a pool with no scale change, which does work -------------------
-    print("\n[6] a pool with no scale change")
+    # ---- 6. a pool with no scale change ------------------------------------
+    print("\n[6] a pool with no scale change (the old collision case)")
     bare = os.path.join(C.ROOT, "demo", "regress", "pool_translates.mlir")
     rec = attempt("bare 7x7 tosa.avg_pool2d", bare, "gap_pool",
                   os.path.join(C.BUILD, "gap_pool.keaf"))
@@ -230,14 +217,24 @@ def main() -> int:
               % (rec["cycles"], 100 * rec["vpu_utilization"]))
     out["attempts"].append(rec)
 
-    ran = [a for a in out["attempts"] if a["ok"]]
-    covered = sum(a["nodes"] for a in ran if a["label"].startswith(
-        ("features, --schedule", "classifier, --schedule")))
+    by_label = {a["label"]: a for a in out["attempts"] if a["ok"]}
+    covered = (by_label["features + pool, --schedule"]["nodes"]
+               + by_label["classifier, --schedule"]["nodes"])
     out["nodes_compiled"] = covered
     out["fraction_of_graph"] = covered / len(g.nodes)
     out["single_program"] = False
-    print("\ncompiled %d of %d nodes (%.1f%%) as two programs"
-          % (covered, len(g.nodes), 100.0 * covered / len(g.nodes)))
+    out["split"] = {
+        "bit_exact": ["features.keaf (0..178)", "host global_avg_pool",
+                      "classifier.keaf (180..182)"],
+        "all_on_npu": ["featpool.keaf (0..179)",
+                       "classifier.keaf (180..182)"],
+        "note": "the all-NPU split needs no host step but is not bit-exact -- "
+                "the frontend's avg_pool2d+rescale substitution rounds twice "
+                "where the reference rounds once. demo/validate_mobilenetv2.py "
+                "measures both.",
+    }
+    print("\n%d of %d nodes (%.1f%%) compile and run on the NPU, as two "
+          "programs" % (covered, len(g.nodes), 100.0 * covered / len(g.nodes)))
 
     C.write_json(os.path.join(C.RESULTS, "compile.json"), out)
     print("wrote demo/results/compile.json")

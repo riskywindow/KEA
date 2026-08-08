@@ -272,25 +272,37 @@ def tiling_report(mlir_path: str, function: str,
     return entries
 
 
-def unsound_regions(stats: Dict) -> List[int]:
-    """TRACE regions whose `begin` was not issued where its layer starts.
+#: A region may legitimately begin a little before a lower-tagged one: the two
+#: sit on different queues, and the later layer's first instruction (a
+#: `kea.load_w`, say) can depend on nothing and issue while the earlier layer's
+#: VPU work is still draining. That is pipelining, not corruption. What is *not*
+#: legitimate is a begin marker that floated to the top of the program, which is
+#: what `-kea-schedule` used to do -- measured at 3.3% of program length and
+#: seven whole regions spanned. 1% of the program cleanly separates the two.
+REGION_ORDER_TOLERANCE = 0.01
 
-    `-kea-schedule` hoists a `kea.trace` begin marker to the top of its queue
-    when nothing depends on it, so in a scheduled build some regions open at
-    cycle ~0 and their `cycles` measure from program start instead of from the
-    layer.  A region is called unsound here when it strictly contains another
-    region that starts earlier -- i.e. `depth > 0` for a region that is not
-    itself nested by construction.  Concretely: any region that begins before
-    the region with the previous tag ends *and* spans it entirely.
 
-    Returns the tags, so a caller can refuse to report those layers rather
-    than quietly summing nonsense.
+def unsound_regions(stats: Dict, tolerance: float = REGION_ORDER_TOLERANCE
+                    ) -> List[int]:
+    """TRACE regions whose `begin` was not issued anywhere near its layer.
+
+    Region tags are assigned in layer order, so `begin_cycle` should be
+    non-decreasing in the tag. A region that opens *materially* before a
+    lower-tagged one has had its marker detached from its layer, and its
+    `cycles` then measures from wherever the marker floated to.
+
+    "Materially" is `tolerance` x the program length -- see
+    ``REGION_ORDER_TOLERANCE``. Returns the offending tags so a caller can
+    refuse to report those layers rather than quietly summing nonsense.
     """
     rs = sorted(stats.get("regions", []), key=lambda r: r["tag"])
+    total = stats.get("total_cycles") or 1
+    slack = tolerance * total
     bad = []
     for i, r in enumerate(rs):
-        earlier = [q for q in rs[:i] if q["begin_cycle"] > r["begin_cycle"]]
-        if earlier:
+        worst = max((q["begin_cycle"] - r["begin_cycle"] for q in rs[:i]),
+                    default=0)
+        if worst > slack:
             bad.append(r["tag"])
     return bad
 

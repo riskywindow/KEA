@@ -2,44 +2,32 @@
  "kgraph": "models/mobilenetv2_int8.kgraph.json",
  "nodes_total": 183,
  "imem_capacity": 32768,
- "defaults": {
-  "spm_reserve_factor": 1,
-  "imem_budget": 20480,
-  "kea_schedule_mode": "auto"
- },
+ "flags": "none: compiler defaults for spm-reserve-factor, imem-budget and -kea-schedule mode",
  "attempts": [
   {
    "label": "whole graph (183 nodes), defaults",
    "ok": false,
    "returncode": 1,
-   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_full.tosa.mlir:9:1: error: 'func.func' op cannot fit this function in the instruction budget: even the coarsest tiling of every layer needs 29241 instructions against a budget of 20480. KEA-1 is branchless, so program size is a hard capacity limit (IMEM holds 32768 instructions and is not paged) -- split the model across invocations, or raise -kea-tile=imem-budget if the headroom reserved for -kea-schedule's SIGNAL/WAIT pairs is too generous.",
+   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_full.tosa.mlir:9:1: error: 'func.func' op cannot fit this function in the instruction budget: even the coarsest tiling of every layer needs 29241 instructions against a budget of 20200. KEA-1 is branchless, so program size is a hard capacity limit (IMEM holds 32768 instructions and is not paged) -- split the model across invocations, or raise -kea-tile=imem-budget if the headroom reserved for -kea-schedule's SIGNAL/WAIT pairs is too generous.",
    "nodes": 183,
    "coarsest_tiling_instructions": 29241,
-   "budget": 20480
+   "budget": 20200
   },
   {
    "label": "whole graph, --imem-budget 29241",
    "ok": false,
    "returncode": 1,
    "imem_budget": 29241,
-   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_full.tosa.mlir:1148:10: error: 'kea.rescale' op has no Level 2 lowering. -kea-tile lowers kea.conv2d, kea.dwconv2d, kea.matmul, kea.fully_connected, kea.pool, quantized kea.add and kea.reshape; kea.rescale, kea.clamp and kea.transpose must be eliminated by -kea-fuse (KEA-1 has no transpose unit and no way to rescale a tensor that never entered ACC).",
+   "instructions": 37295,
+   "error": "/Users/rishivinodkumar/npu/demo/build/full_29241.kasm:32896:9: error: program exceeds IMEM: more than 32768 instructions",
    "nodes": 183
   },
   {
-   "label": "probe, --imem-budget 29241",
-   "ok": false,
-   "returncode": 1,
-   "imem_budget": 29241,
-   "instructions": 36633,
-   "error": "/Users/rishivinodkumar/npu/demo/build/probe_29241.kasm:32894:9: error: program exceeds IMEM: more than 32768 instructions",
-   "nodes": 183
-  },
-  {
-   "label": "probe, --imem-budget 32768",
+   "label": "whole graph, --imem-budget 32768",
    "ok": false,
    "returncode": 1,
    "imem_budget": 32768,
-   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_full_norescale.tosa.mlir:9:1: error: 'func.func' op lowers to 32772 KEA-1 instructions, more than IMEM holds (32768), and -kea-schedule still has to add its SIGNAL/WAIT pairs",
+   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_full.tosa.mlir:9:1: error: 'func.func' op lowers to 32786 KEA-1 instructions, more than IMEM holds (32768), and -kea-schedule still has to add its SIGNAL/WAIT pairs",
    "nodes": 183
   },
   {
@@ -47,7 +35,7 @@
    "ok": true,
    "returncode": 0,
    "schedule": false,
-   "instructions": 30498,
+   "instructions": 28730,
    "nodes": 179,
    "fits_imem": true
   },
@@ -56,8 +44,26 @@
    "ok": true,
    "returncode": 0,
    "schedule": true,
-   "instructions": 30430,
+   "instructions": 28675,
    "nodes": 179,
+   "fits_imem": true
+  },
+  {
+   "label": "features + pool, no --schedule",
+   "ok": true,
+   "returncode": 0,
+   "schedule": false,
+   "instructions": 29398,
+   "nodes": 180,
+   "fits_imem": true
+  },
+  {
+   "label": "features + pool, --schedule",
+   "ok": true,
+   "returncode": 0,
+   "schedule": true,
+   "instructions": 29346,
+   "nodes": 180,
    "fits_imem": true
   },
   {
@@ -65,7 +71,7 @@
    "ok": true,
    "returncode": 0,
    "schedule": false,
-   "instructions": 10539,
+   "instructions": 10833,
    "nodes": 3,
    "fits_imem": true
   },
@@ -74,15 +80,15 @@
    "ok": true,
    "returncode": 0,
    "schedule": true,
-   "instructions": 10507,
+   "instructions": 10753,
    "nodes": 3,
    "fits_imem": true
   },
   {
    "label": "head pool: avg_pool2d + rescale (1 node)",
-   "ok": false,
-   "returncode": 1,
-   "error": "/Users/rishivinodkumar/npu/demo/build/mobilenetv2_pool.tosa.mlir:15:10: error: 'kea.rescale' op has no Level 2 lowering. -kea-tile lowers kea.conv2d, kea.dwconv2d, kea.matmul, kea.fully_connected, kea.pool, quantized kea.add and kea.reshape; kea.rescale, kea.clamp and kea.transpose must be eliminated by -kea-fuse (KEA-1 has no transpose unit and no way to rescale a tensor that never entered ACC).",
+   "ok": true,
+   "returncode": 0,
+   "instructions": 666,
    "nodes": 1
   },
   {
@@ -97,17 +103,32 @@
  ],
  "full_graph_mlir_roundtrip": true,
  "full_graph_mlir_bytes": 7436599,
- "structural_probe": {
-  "note": "the pool's 1.3885 scale change is deleted; this program is numerically wrong and is compiled only to measure program size",
-  "instructions_at_coarsest_tiling": 36633,
-  "over_imem_by": 3865,
+ "capacity": {
+  "imem": 32768,
+  "coarsest_tiling_budget": 29241,
+  "instructions_at_coarsest_tiling": 37295,
+  "over_imem_by": 4527,
+  "over_imem_pct": 13.8153076171875,
   "fits_imem": false
  },
  "shipped": {
   "features.keaf": "nodes 0..178, --schedule, defaults",
+  "featpool.keaf": "nodes 0..179 (pool on the NPU), --schedule, defaults",
   "classifier.keaf": "nodes 180..182, --schedule, defaults"
  },
- "nodes_compiled": 182,
- "fraction_of_graph": 0.994535519125683,
- "single_program": false
+ "nodes_compiled": 183,
+ "fraction_of_graph": 1.0,
+ "single_program": false,
+ "split": {
+  "bit_exact": [
+   "features.keaf (0..178)",
+   "host global_avg_pool",
+   "classifier.keaf (180..182)"
+  ],
+  "all_on_npu": [
+   "featpool.keaf (0..179)",
+   "classifier.keaf (180..182)"
+  ],
+  "note": "the all-NPU split needs no host step but is not bit-exact -- the frontend's avg_pool2d+rescale substitution rounds twice where the reference rounds once. demo/validate_mobilenetv2.py measures both."
+ }
 }

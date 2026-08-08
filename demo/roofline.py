@@ -7,18 +7,15 @@ recomputed by hand except the two derived columns the JSON does not carry
 (``% of attainable`` is in the JSON as ``efficiency``; ``cycles`` share is
 arithmetic on ``cycles``).
 
-**Which build the per-layer table comes from, and why.**  `-kea-schedule`
-hoists a `kea.trace` begin marker to the top of its queue when nothing depends
-on it, so in a *scheduled* build some TRACE regions open at cycle ~0 and their
-`cycles` measure from program start rather than from the layer.  On the shipped
-feature extractor that corrupts 10 of 52 regions.  The per-layer table is
-therefore taken from the **unscheduled** build, where every region is sound;
-the whole-network headline is the **scheduled** build, which is what ships.
-`common.unsound_regions` checks this rather than trusting it, and the run fails
-if the unscheduled build ever develops the same problem.
+**Per-layer numbers come from the scheduled build**, which is what ships.  That
+was not always safe: `-kea-schedule` used to hoist `kea.trace` begin markers
+away from their region, so some regions opened at cycle ~0 and 52 of them
+summed to 7.4x the program length.  It is fixed, but the check that caught it
+stays: `common.unsound_regions` is run over **every** build here and the script
+aborts rather than reporting a per-layer table it cannot vouch for.
 
-Inputs   demo/build/features.keaf + features_unsched.keaf,
-         demo/build/classifier.keaf + classifier_unsched.keaf
+Inputs   demo/build/{features,featpool,classifier}.keaf and their
+         _unsched counterparts
 Outputs  demo/results/roofline.json, demo/results/roofline_layers.csv,
          demo/roofline_mobilenetv2.png
 
@@ -50,7 +47,7 @@ GRID = "#dcdbd6"
 SURFACE = "#fcfcfb"
 
 
-def collect_layers(stats, kgraph_layers, tiling, sched_stats=None):
+def collect_layers(stats, kgraph_layers, tiling, unsched_stats=None):
     """Join TRACE regions to kgraph layer names.
 
     `-kea-tile` numbers its layers in the order it lowers the Level 1
@@ -59,11 +56,10 @@ def collect_layers(stats, kgraph_layers, tiling, sched_stats=None):
     nodes, so region tag *i* is kgraph contraction *i*.  The tiling report's
     `op` field is used as a consistency check, not as the source of the name.
 
-    `sched_stats`, when given, contributes a `scheduled_cycles` column -- left
-    empty for the regions the scheduler's marker hoisting corrupts.
+    `unsched_stats`, when given, contributes an `unscheduled_cycles` column, so
+    the per-layer A/B is visible in the same table as the roofline position.
     """
-    bad_sched = set(C.unsound_regions(sched_stats)) if sched_stats else set()
-    sched = {r["tag"]: r for r in (sched_stats or {}).get("regions", [])}
+    unsched = {r["tag"]: r for r in (unsched_stats or {}).get("regions", [])}
     rows = []
     for r in sorted(stats["regions"], key=lambda x: x["tag"]):
         tag = r["tag"]
@@ -83,8 +79,8 @@ def collect_layers(stats, kgraph_layers, tiling, sched_stats=None):
             "node": lay.name,
             "op": lay.op,
             "cycles": r["cycles"],
-            "scheduled_cycles": ("" if tag in bad_sched or tag not in sched
-                                 else sched[tag]["cycles"]),
+            "unscheduled_cycles": (unsched[tag]["cycles"] if tag in unsched
+                                   else ""),
             "ops_useful": rf["ops_useful"],
             "ops_issued": rf["ops_issued"],
             "padding_efficiency": rf["padding_efficiency"],
@@ -182,7 +178,9 @@ def plot(rows, nets, path, peak_gops, peak_bw, ridge):
     ax.annotate("peak %g GOPS int8 (256 MAC/cycle @ 1 GHz)" % peak_gops,
                 xy=(xhi, peak_gops), xytext=(-4, 5), textcoords="offset points",
                 ha="right", va="bottom", color=INK, fontsize=8.5)
-    lx = xlo * 1.25
+    # kept hard left: the lowest-intensity layer sits on the roof, and the
+    # label would otherwise run under its marker
+    lx = xlo * 1.02
     ax.annotate("DRAM roof %g GB/s" % peak_bw, xy=(lx, lx * peak_bw),
                 xytext=(4, -3), textcoords="offset points", rotation=33,
                 rotation_mode="anchor", ha="left", va="top", color=INK2,
@@ -230,11 +228,14 @@ def plot(rows, nets, path, peak_gops, peak_bw, ridge):
     # direct labels on the extremes, which is where the story is
     lo = min(rows, key=lambda r: r["intensity_ops_per_byte"])
     hi = max(rows, key=lambda r: r["achieved_gops"])
-    for r, dx, dy, ha in ((lo, 7, 6, "left"), (hi, -7, 6, "right")):
+    # the lowest-intensity layer sits ON the DRAM roof, whose rotated label
+    # runs through the space to its upper right -- so label it downwards
+    for r, dx, dy, ha, va in ((lo, 8, -9, "left", "top"),
+                              (hi, -7, 6, "right", "bottom")):
         ax.annotate("%s L%d" % (r["op"].replace("depthwise_conv2d", "dwconv"),
                                 r["layer"]),
                     xy=(r["intensity_ops_per_byte"], r["achieved_gops"]),
-                    xytext=(dx, dy), textcoords="offset points", ha=ha,
+                    xytext=(dx, dy), textcoords="offset points", ha=ha, va=va,
                     fontsize=8, color=INK2)
 
     ax.set_xscale("log")
@@ -260,8 +261,8 @@ def plot(rows, nets, path, peak_gops, peak_bw, ridge):
     fig.text(0.008, 0.012,
              "cycle-approximate; kea-sim counts are a lower bound "
              "(docs/SIMULATOR.md §2). 1 MAC = 2 ops.\n"
-             "Layer points are the unscheduled build — see the TRACE region "
-             "caveat in docs/RESULTS.md §5.2.",
+             "Layer points and both network points are the scheduled build at "
+             "the compiler defaults; all 183 nodes run on the NPU.",
              fontsize=7.2, color=INK2, linespacing=1.5)
     fig.tight_layout(rect=(0, 0.055, 1, 1))
     fig.savefig(path, facecolor=SURFACE)
@@ -272,8 +273,9 @@ def main() -> int:
     C.require_tools()
     C.ensure_dirs()
     keafs = {k: os.path.join(C.BUILD, k + ".keaf")
-             for k in ("features", "classifier",
-                       "features_unsched", "classifier_unsched")}
+             for k in ("features", "featpool", "classifier",
+                       "features_unsched", "featpool_unsched",
+                       "classifier_unsched")}
     for p in keafs.values():
         if not os.path.exists(p):
             raise SystemExit("run demo/compile_mobilenetv2.py first (%s)" % p)
@@ -284,21 +286,38 @@ def main() -> int:
         C.simulate(p, stats_json=j)
         st[k] = C.load_stats(j)
 
-    # The scheduler hoists TRACE begin markers; check both builds and say so.
-    region_health = {k: C.unsound_regions(v) for k, v in st.items()}
-    for k in ("features_unsched", "classifier_unsched"):
-        if region_health[k]:
-            raise SystemExit(
-                "TRACE regions in the unscheduled %s build are out of order "
-                "(tags %s); the per-layer table has no sound source" %
-                (k, region_health[k]))
-    if region_health["features"]:
-        print("note: %d of %d TRACE regions in the SCHEDULED feature "
-              "extractor open at program start (tags %s) -- -kea-schedule "
-              "hoists their begin markers. Per-layer cycles are taken from "
-              "the unscheduled build."
-              % (len(region_health["features"]), len(st["features"]["regions"]),
-                 region_health["features"]))
+    # TRACE regions used to come back scrambled from a scheduled build. Fixed
+    # -- but verified here, on every build, before anything per-layer is
+    # reported. `ratio` is the region sum over the program length: consecutive
+    # layers genuinely overlap a little, so it sits just above 1.0; the bug
+    # drove it to 7.4.
+    region_health = {}
+    for k, v in st.items():
+        rs = v.get("regions", [])
+        if not rs:
+            continue
+        region_health[k] = {
+            "regions": len(rs),
+            "unsound_tags": C.unsound_regions(v),
+            "max_depth": max(r["depth"] for r in rs),
+            "sum_over_total": sum(r["cycles"] for r in rs) / v["total_cycles"],
+        }
+    for k, h in sorted(region_health.items()):
+        print("regions %-20s n=%-3d unsound=%-4s max_depth=%d  "
+              "sum/total=%.3f" % (k, h["regions"], len(h["unsound_tags"]),
+                                  h["max_depth"], h["sum_over_total"]))
+    # Two independent gates. The per-region one catches a marker detached from
+    # its layer; the aggregate one catches the same thing from the other side
+    # and would fire even if the ordering check were tuned wrong. The bug this
+    # guards against measured 7.43 and depth 11.
+    bad = sorted(k for k, h in region_health.items()
+                 if h["unsound_tags"] or h["sum_over_total"] > 1.5
+                 or h["max_depth"] > 2)
+    if bad:
+        raise SystemExit(
+            "TRACE regions are not sound in %s (%s); refusing to report a "
+            "per-layer table from them"
+            % (", ".join(bad), {k: region_health[k] for k in bad}))
 
     g = KGraph.load(C.KGRAPH)
     groups = [l for l in C.layer_groups(g) if l.op in C.CONTRACTIONS]
@@ -306,16 +325,16 @@ def main() -> int:
         os.path.join(C.BUILD, "mobilenetv2_features.tosa.mlir"),
         "mnv2_features")
 
-    rows = collect_layers(st["features_unsched"], groups, tiling,
-                          sched_stats=st["features"])
+    rows = collect_layers(st["features"], groups, tiling,
+                          unsched_stats=st["features_unsched"])
 
     # the classifier is its own program, so it contributes one whole-program
     # point rather than a region.
-    crf = st["classifier_unsched"]["global"]["roofline"]
+    crf = st["classifier"]["global"]["roofline"]
     rows.append({
         "layer": len(rows), "node": "fc#182", "op": "fully_connected",
-        "cycles": st["classifier_unsched"]["total_cycles"],
-        "scheduled_cycles": st["classifier"]["total_cycles"],
+        "cycles": st["classifier"]["total_cycles"],
+        "unscheduled_cycles": st["classifier_unsched"]["total_cycles"],
         "ops_useful": crf["ops_useful"], "ops_issued": crf["ops_issued"],
         "padding_efficiency": crf["padding_efficiency"],
         "dram_bytes": crf["dram_bytes"],
@@ -325,27 +344,37 @@ def main() -> int:
         "pct_of_attainable": 100.0 * crf["efficiency"],
         "bound": "MEMORY" if crf["memory_bound"] else "COMPUTE",
         "mxu_mac_utilization":
-            st["classifier_unsched"]["global"]["mxu"]["mac_utilization"],
+            st["classifier"]["global"]["mxu"]["mac_utilization"],
         "dwu_mac_utilization":
-            st["classifier_unsched"]["global"]["dwu"]["mac_utilization"],
+            st["classifier"]["global"]["dwu"]["mac_utilization"],
     })
 
-    programs = [whole(st["features"], "features (52 conv layers), scheduled"),
+    programs = [whole(st["featpool"], "features + head pool, scheduled"),
                 whole(st["classifier"], "classifier (fully_connected), "
                                         "scheduled"),
-                whole(st["features_unsched"], "features, unscheduled"),
-                whole(st["classifier_unsched"], "classifier, unscheduled")]
+                whole(st["featpool_unsched"], "features + head pool, "
+                                              "unscheduled"),
+                whole(st["classifier_unsched"], "classifier, unscheduled"),
+                whole(st["features"], "features only (52 conv), scheduled"),
+                whole(st["features_unsched"], "features only, unscheduled")]
 
-    hz = st["features"]["clock_hz"]
-    # The global average pool between the two programs does not compile and is
-    # NOT counted here (62,720 additions, 0.01% of the network's arithmetic --
-    # see docs/RESULTS.md section 3).
+    hz = st["featpool"]["clock_hz"]
+    # Every one of the 183 nodes is on the NPU now: featpool.keaf carries the
+    # global average pool, so nothing runs on the host between the two
+    # programs. `whole_network_bit_exact` is the alternative split that keeps
+    # the pool on the host to stay bit-exact -- see validate_mobilenetv2.py.
     comb = combine(programs[:2], hz, "whole network (scheduled)",
-                   "whole compiled network = features + classifier, scheduled")
-    comb_u = combine(programs[2:], hz, "unscheduled",
-                     "whole compiled network, unscheduled")
-    for c, a, b in ((comb, st["features"], st["classifier"]),
-                    (comb_u, st["features_unsched"], st["classifier_unsched"])):
+                   "whole network on the NPU = featpool + classifier, "
+                   "scheduled")
+    comb_u = combine(programs[2:4], hz, "unscheduled",
+                     "whole network on the NPU, unscheduled")
+    comb_be = combine([programs[4], programs[1]], hz,
+                      "bit-exact split (host pool)",
+                      "features + host pool + classifier, scheduled")
+    for c, a, b in ((comb, st["featpool"], st["classifier"]),
+                    (comb_u, st["featpool_unsched"],
+                     st["classifier_unsched"]),
+                    (comb_be, st["features"], st["classifier"])):
         c["mxu_mac_utilization"] = (
             (a["global"]["mxu"]["macs_useful"]
              + b["global"]["mxu"]["macs_useful"]) / (c["cycles"] * 256.0))
@@ -359,26 +388,27 @@ def main() -> int:
     out = {
         "whole_network": comb,
         "whole_network_unscheduled": comb_u,
+        "whole_network_bit_exact": comb_be,
         "programs": programs,
         "layers": rows,
-        "layer_source_build": "unscheduled",
-        "scheduled_regions_unsound": region_health["features"],
+        "layer_source_build": "scheduled",
+        "region_health": region_health,
         "layer_cycle_sum": region_cycles,
         "layer_cycle_overlap_pct":
-            100.0 * (region_cycles - st["features_unsched"]["total_cycles"])
-            / st["features_unsched"]["total_cycles"],
+            100.0 * (region_cycles - st["features"]["total_cycles"])
+            / st["features"]["total_cycles"],
         "memory_bound_layers": [r["layer"] for r in rows if r["bound"] == "MEMORY"],
         "note": "TRACE regions cover every unit active inside their cycle "
                 "window, and consecutive layers overlap, so per-layer cycles "
-                "sum to more than the program total. Per-layer rows come from "
-                "the unscheduled build because -kea-schedule hoists some TRACE "
-                "begin markers to program start.",
+                "sum to a little more than the program total. Per-layer rows "
+                "come from the scheduled build; region_health records the "
+                "soundness check that licenses that.",
     }
     C.write_json(os.path.join(C.RESULTS, "roofline.json"), out)
 
     csv = os.path.join(C.RESULTS, "roofline_layers.csv")
-    cols = ["layer", "node", "op", "cycles", "scheduled_cycles", "ops_useful",
-            "ops_issued", "padding_efficiency", "dram_bytes",
+    cols = ["layer", "node", "op", "cycles", "unscheduled_cycles",
+            "ops_useful", "ops_issued", "padding_efficiency", "dram_bytes",
             "intensity_ops_per_byte", "achieved_gops", "attainable_gops",
             "pct_of_attainable", "bound", "mxu_mac_utilization",
             "dwu_mac_utilization"]

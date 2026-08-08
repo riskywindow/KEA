@@ -11,11 +11,11 @@ Four experiments, all reported:
 1. **the whole 52-convolution feature extractor**, compiled with and without
    `--schedule` and run on `kea-sim`.  This is the headline: it is the artifact
    that ships.
-2. **`-kea-schedule mode=serial`**, the pass's own control.  `mode=auto` costs
-   an overlapped plan against a serial one and keeps the cheaper, so it cannot
-   lose *to serial* -- but "no `-kea-schedule` at all" is a third program
-   (`kea-translate` inserts the synchronization itself), and whether auto beats
-   *that* is an empirical question this answers.
+2. **`-kea-schedule mode=serial` and `mode=overlap`**, the pass's own controls.
+   `mode=auto` promises either a program its model predicts >=5% faster than
+   not scheduling, or output byte-identical to omitting `--schedule`.  The
+   sweep is where that bites, and the byte-identity is checked with `cmp`, not
+   inferred from equal cycle counts.
 3. **an `-kea-tile=imem-budget` sweep**, because the budget picks the tiling
    and the tiling picks the cycle count.  The feasible window is narrow at both
    ends and the curve inside it is not monotonic.
@@ -28,6 +28,7 @@ Four experiments, all reported:
 from __future__ import annotations
 
 import argparse
+import filecmp
 import os
 import sys
 
@@ -38,13 +39,14 @@ from kea_frontend.ir import KGraph  # noqa: E402
 
 CLASSIFIER_SLICE = (180, 182)
 LAST_FEATURE_NODE = 178
-DEFAULT_BUDGET = 20480
+DEFAULT_BUDGET = 20200
 
-#: `-kea-tile` refuses below ~19,066 (its own coarsest-tiling floor for this
-#: network) and `kea-as` refuses above ~21,3xx (over IMEM), so the sweep only
-#: has a few hundred instructions of room either side of the default.
-SWEEP = [19066, 19200, 19500, 19750, 20000, 20200, 20480, 20750, 21000, 21250,
-         21500]
+#: `-kea-tile` refuses below 19,066 -- its own coarsest tiling of all 52 layers
+#: of this network -- and `kea-as` refuses once the finished program passes the
+#: 32,768-entry IMEM. The sweep spans that whole window and one step past each
+#: end, so both walls are measured rather than assumed.
+SWEEP = [19000, 19066, 19200, 19500, 19750, 20000, 20200, 20480, 20750, 21000,
+         21500, 22000, 22500, 23000, 24000]
 
 
 def build_and_run(tag, mlir, fn, **kw):
@@ -102,9 +104,10 @@ def main() -> int:
 
     C.require_tools()
     C.ensure_dirs()
-    out = {"defaults": {"spm_reserve_factor": 1,
-                        "imem_budget": DEFAULT_BUDGET,
-                        "kea_schedule_mode": "auto"},
+    # DEFAULT_BUDGET only labels the sweep row that matches the compiler's
+    # own default; the A/B itself passes no flags.
+    out = {"flags": "none except where a row names one",
+           "default_imem_budget_assumed": DEFAULT_BUDGET,
            "per_layer": []}
 
     feat = os.path.join(C.BUILD, "mobilenetv2_features.tosa.mlir")
@@ -167,6 +170,7 @@ def main() -> int:
               % ("budget", "u.instrs", "u.cycles", "s.instrs", "s.cycles",
                  "speedup"))
         sweep = []
+        serial_done = False
         for b in SWEEP:
             u = build_and_run("sweep.%d.unscheduled" % b, feat,
                               "mnv2_features", imem_budget=b)
@@ -174,14 +178,24 @@ def main() -> int:
                               imem_budget=b, schedule=True)
             row = {"imem_budget": b, "unscheduled": u, "scheduled": s,
                    "default": b == DEFAULT_BUDGET}
-            if b == SWEEP[0]:
-                # At the tightest feasible budget `--schedule` loses to not
-                # scheduling. Cost mode=serial too, to show that auto still
-                # beats *its* baseline -- i.e. that the guarantee holds and is
-                # guarding the wrong thing.
+            if u.get("ok") and s.get("ok"):
+                # `mode=auto`'s fallback is "emit exactly what no-schedule
+                # emits". Equal cycle counts are consistent with that but do
+                # not establish it -- diff the assembly.
+                row["identical_to_unscheduled"] = filecmp.cmp(
+                    os.path.join(C.BUILD, "ab",
+                                 "sweep.%d.unscheduled.kasm" % b),
+                    os.path.join(C.BUILD, "ab", "sweep.%d.scheduled.kasm" % b),
+                    shallow=False)
+            if s.get("ok") and not serial_done:
+                # At the tightest feasible budget, cost mode=serial too. This
+                # is where `mode=auto` used to lose to not scheduling at all;
+                # its guarantee is now "beat no-schedule by 5% or emit exactly
+                # what no-schedule emits", and this row is where that bites.
                 row["serial"] = build_and_run("sweep.%d.serial" % b, feat,
                                               "mnv2_features", imem_budget=b,
                                               schedule_mode="serial")
+                serial_done = True
             if u.get("ok") and s.get("ok"):
                 row["speedup"] = u["cycles"] / float(s["cycles"])
             sweep.append(row)
@@ -190,7 +204,9 @@ def main() -> int:
                      u.get("instructions", "-"), u.get("cycles", "FAIL"),
                      s.get("instructions", "-"), s.get("cycles", "FAIL"),
                      "%.3fx" % row["speedup"] if "speedup" in row else "-",
-                     "   <- default" if b == DEFAULT_BUDGET else ""))
+                     ("   <- default" if b == DEFAULT_BUDGET else "")
+                     + ("  (identical .kasm)"
+                        if row.get("identical_to_unscheduled") else "")))
         out["imem_budget_sweep"] = sweep
         ok = [r for r in sweep if r["scheduled"].get("ok")]
         if ok:

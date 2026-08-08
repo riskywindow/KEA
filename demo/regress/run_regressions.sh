@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 #===----------------------------------------------------------------------===#
-# Regression tests for the four backend defects found during MobileNetV2
-# bring-up, plus the two limitations that are still open.
+# Regression tests for the six backend defects found during MobileNetV2
+# bring-up. All six are fixed; every case here pins the fixed behaviour so it
+# cannot silently regress.
 #
 # This used to be demo/repro/run_repro.sh, which asserted that each defect was
-# still *broken*. All four are fixed, so the assertions are inverted: each case
-# now pins the fixed behaviour so it cannot silently regress.
+# still *broken*.
 #
 #   PASS  the fixed behaviour still holds
 #   FAIL  it regressed  -> exit 1
-#   OPEN  a known limitation, still limited in exactly the documented way
-#         (informational; does not fail the run)
 #
 #   bash demo/regress/run_regressions.sh
 #===----------------------------------------------------------------------===#
@@ -26,7 +24,6 @@ fail=0
 
 pass() { echo "PASS  $1"; }
 bad()  { echo "FAIL  $1"; shift; sed 's/^/    /' <<<"$*" | head -4; fail=1; }
-open_() { echo "OPEN  $1"; shift; sed 's/^/    /' <<<"$*" | head -2; }
 
 # <label> <cmd...> -- the command must succeed
 expect_ok() {
@@ -98,16 +95,33 @@ else
 fi
 
 echo
-echo "=== still open (informational, not failures)"
-out="$("${KEAC}" "${HERE}/pool_rescale_unsupported.mlir" --function pool_rescale \
-      -o "${TMP}/pr.keaf" 2>&1)"
-if grep -qF "'kea.rescale' op has no Level 2 lowering" <<<"${out}"; then
-  open_ "a general rescale after a pool still has no lowering" \
-        "$(grep -m1 -oE 'error: .kea.rescale. op has no Level 2 lowering' \
-           <<<"${out}")"
+echo "=== 5. a standalone kea.rescale lowers (pool + rescale)"
+expect_ok "avg_pool2d + rescale compiles" \
+  "${KEAC}" "${HERE}/pool_rescale.mlir" --function pool_rescale \
+  -o "${TMP}/pr.keaf"
+expect_ok "  and runs clean" \
+  "${KEA_SIM}" "${TMP}/pr.keaf" --quiet --strict-poison --strict-hazards
+
+echo
+echo "=== 6. TRACE regions stay with their layer in a scheduled build"
+if [[ -x "${PY}" ]] && [[ -f "${TMP}/s.keaf" ]]; then
+  "${KEA_SIM}" "${TMP}/s.keaf" --quiet --stats-json "${TMP}/s.json" >/dev/null 2>&1
+  if "${PY}" - "${TMP}/s.json" <<'EOF'
+import json, sys
+sys.path.insert(0, "demo")
+import common as C
+s = json.load(open(sys.argv[1]))
+bad = C.unsound_regions(s)
+ratio = sum(r["cycles"] for r in s["regions"]) / s["total_cycles"]
+depth = max(r["depth"] for r in s["regions"])
+print("    %d regions, %d unsound, max depth %d, sum/total %.3f"
+      % (len(s["regions"]), len(bad), depth, ratio))
+sys.exit(0 if not bad and ratio < 1.5 and depth <= 2 else 1)
+EOF
+  then pass "52 regions sound in the scheduled feature extractor"
+  else bad "TRACE regions detached from their layers again"; fi
 else
-  echo "CHANGED  pool+rescale now behaves differently -- update docs/RESULTS.md"
-  sed 's/^/    /' <<<"${out}" | head -3
+  echo "  skipped"
 fi
 
 exit ${fail}

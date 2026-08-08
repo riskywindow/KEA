@@ -4,8 +4,6 @@
 
 .region 0, "slice_6_7.0"
 
-layer0:
-  MXU   TRACE   kind=begin, tag=0, payload=0
   VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:0, row_bytes=28688, rows=1, src_row_stride=0, dst_row_stride=28688, fill_value=-128
   VPU   SIGNAL  event=3, inc=1
   VPU   SIGNAL  event=1, inc=1
@@ -13,6 +11,8 @@ layer0:
   DMA0  SIGNAL  event=0, inc=1
   DMA1  DMA_LD  spm_space=SPM_W, dram_addr=@slice_6_7.0.qparams, spm_addr=w:512, len0=192, n1=1, n2=1, dram_s1=192, dram_s2=192, spm_s1=192, spm_s2=192
   DMA1  SIGNAL  event=6, inc=1
+layer0:
+  MXU   TRACE   kind=begin, tag=0, payload=0
   MXU   WAIT    event=0, threshold=1
   MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
   VPU   VCOPY   mode=fill, src_space=SPM_A, dst_space=SPM_A, src_addr=a:0, dst_addr=a:28688, row_bytes=28688, rows=1, src_row_stride=0, dst_row_stride=28688, fill_value=-128
@@ -301,6 +301,7 @@ layer0:
   MXU   MATMUL  a_addr=a:57392, a_inner_stride=32, a_outer_stride=3584, m_inner=112, m_outer=8, acc_addr=acc:14336, acc_inner_stride=16w, acc_outer_stride=1792w, bank=1, acc_mode=accumulate, dtype=int8
   MXU   SIGNAL  event=5, inc=1
   MXU   SIGNAL  event=7, inc=1
+  MXU   TRACE   kind=end, tag=0, payload=0
   VPU   WAIT    event=5, threshold=1
   VPU   VQUANT  acc_addr=acc:14336, out_addr=a:200848, qparam_addr=w:512, num_pixels=896, channels=16, acc_pix_stride=16w, out_pix_stride=16, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
   VPU   SIGNAL  event=1, inc=1
@@ -310,5 +311,4 @@ layer0:
   DMA0  WAIT    event=7, threshold=1
   DMA0  WAIT    event=1, threshold=1
   DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out+186368, spm_addr=a:200848, len0=16, n1=112, n2=8, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
-  MXU   TRACE   kind=end, tag=0, payload=0
   CTRL  HALT    exit_code=0

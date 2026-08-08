@@ -89,7 +89,7 @@ on 21+), a C++17 compiler, and the venv described in `docs/PLATFORM.md`.
 
 ```sh
 source scripts/env.sh
-bash scripts/build_compiler.sh     # kea-opt, kea-translate + 34 lit tests (~6 min)
+bash scripts/build_compiler.sh     # kea-opt, kea-translate + 35 lit tests (~6 min)
 bash scripts/build.sh              # kea-as, kea-dis, kea-sim, kea-rt, keac + 17 tests
 .venv/bin/python -m pytest frontend/tests        # 92 tests
 .venv/bin/python tools/keac/tests/numeric_check.py   # 7 layouts, bit-exact
@@ -117,9 +117,9 @@ build/native/bin/kea-sim /tmp/m.keaf --stats-json /tmp/m.stats.json
 ```
 
 `keac --imem-budget <n>` exposes the tiler's whole-function instruction budget
-(default 20480 of the 32768 IMEM holds). It is the knob that picks the tiling,
-and therefore the cycle count — see `docs/RESULTS.md` §6.2 for the measured
-curve.
+— the knob that picks the tiling, and therefore the cycle count. The default is
+the measured optimum for this network; `docs/RESULTS.md` §6.2 has the curve,
+including the cliff below it.
 
 ---
 
@@ -127,56 +127,51 @@ curve.
 
 **MobileNetV2 int8, 224×224, batch 1**, `models/mobilenetv2_int8.kgraph.json`
 (torchvision `IMAGENET1K_V1`, percentile observer, BN folded). **Everything at
-the compiler's defaults** — no flags, nothing pinned.
+the compiler's defaults** — the demo passes no tuning flag anywhere.
 
 | | |
 |---|---|
-| Nodes compiled and run | **182 of 183** (the global average pool does not compile — see below) |
+| Nodes compiled and run **on the NPU** | **183 of 183** — nothing runs on the host |
 | Convolutions | **52 of 52**, all scheduled |
-| Total cycles | **3,316,341** = 3.32 ms at 1 GHz (3,868,452 unscheduled) |
-| Instructions | 40,937 across two programs, against a 32,768-entry IMEM |
-| Useful arithmetic | 601.5 Mops (300.8 M MACs) |
-| DRAM moved | 22.9 MB (16.2 MB read, 6.7 MB written) |
-| Arithmetic intensity | **26.3 ops/byte** — below the 32.0 ridge point, so **memory bound** |
-| Achieved | **181.4 GOPS** of 420.2 attainable = **43.2%** |
-| MXU MAC utilisation | **33.0%** of the 256 int8 MAC/cycle peak |
+| Programs | **2** — the network is 37,295 instructions at its coarsest tiling and IMEM holds 32,768 |
+| Total cycles | **3,230,350** = 3.23 ms at 1 GHz (3,854,857 unscheduled) |
+| Instructions | 40,099 across the two programs |
+| Useful arithmetic | 601.6 Mops (300.8 M MACs) |
+| DRAM moved | 22.7 MB (16.0 MB read, 6.7 MB written) |
+| Arithmetic intensity | **26.5 ops/byte** — below the 32.0 ridge point, so **memory bound** |
+| Achieved | **186.2 GOPS** of 424.7 attainable = **43.9%** |
+| MXU MAC utilisation | **33.9%** of the 256 int8 MAC/cycle peak |
 | MXU padding efficiency | 93.3% (useful ÷ issued MACs) |
-| Numerical result | **bit-exact** vs the numpy reference on all 4 golden vectors, 4/4 argmax agreement — on the *scheduled* build |
-| `--kea-schedule` A/B | **1.174×** on the whole 52-convolution feature extractor; 1.166× on the whole compiled network |
+| Numerical result | **bit-exact** on the split that keeps the pool on the host; **±1 on 11.4% of logits, argmax 4/4**, with the pool on the NPU |
+| `--kea-schedule` A/B | **1.181×** on the 52-convolution feature extractor, **1.193×** on the whole network |
 
 **Caveats, in order of how much they matter.**
 
 1. **MobileNetV2 does not fit in one program, and cannot.** At the coarsest
-   tiling of every layer it is **36,633 KEA-1 instructions against a 32,768
-   entry IMEM — 11.8% over**. That is a capacity result, not a bug: the machine
-   is branchless, so program size is a hard limit. Separately, the head pool
-   changes activation scale, and a `tosa.rescale` that is not attached to a
-   contraction has no Level 2 lowering — so the pool runs **on the host** with
-   the frontend's own reference kernel and the demo ships **two** `.keaf`
-   programs. That node is 62,720 additions, 0.01% of the network's arithmetic,
-   but it is not running on the NPU and this is not a single-program inference.
-   Both blockers are measured in `docs/RESULTS.md` §2.1.
-2. **`kea-sim` cycle counts are a lower bound.** Scratchpad port arbitration,
+   tiling of every layer it is **37,295 KEA-1 instructions against a 32,768
+   entry IMEM — 13.8% over**. That is a capacity result, not a bug: the machine
+   is branchless and IMEM is not paged, so program size is a hard limit. Every
+   op in the graph lowers; it is purely size. `docs/RESULTS.md` §2.1 measures it
+   three ways.
+2. **All 183 nodes on the NPU, or bit-exactness — not both.** The cut can go
+   either side of the head pool. Keep the pool on the host and the result is
+   bit-exact against the numpy reference on all four golden vectors. Put it on
+   the NPU and 11.4% of the logits shift by exactly ±1, with the argmax
+   unchanged 4/4 — because the frontend can only spell a scale-changing pool as
+   `avg_pool2d` + `rescale`, which rounds twice where the reference rounds once.
+   That is a Level 1 dialect limitation, not a backend one. `docs/RESULTS.md`
+   §4.2.
+3. **`kea-sim` cycle counts are a lower bound.** Scratchpad port arbitration,
    DRAM row buffers, refresh and turnaround, and misalignment costs are all
    unmodelled (`docs/SIMULATOR.md` §2). Real LPDDR would cost 10–30% more on
-   scattered access.
-3. **The IMEM-aware tiler trades bandwidth for instructions, and it shows.**
-   Against the previously recorded greedy-tiling build it moves **22.9% more
-   DRAM bytes** and pushes the network from just above the ridge point to
-   memory bound. Scheduling more than pays that back — but the tiler is
-   optimising instructions against a modelled cycle cost that is evidently not
-   tracking DRAM traffic. `docs/RESULTS.md` §5.1 has the side-by-side.
-4. **The `imem-budget` knob is narrow and its curve is not monotonic.** Only
-   about 19,100–21,300 is feasible at all, and the measured optimum is
-   `--imem-budget 20200` at **3,130,202** cycles, 1.44% under the default. At
-   the two tightest budgets `--schedule` is a **6% regression** against not
-   scheduling. `docs/RESULTS.md` §6.2.
-5. **Per-layer cycles cannot be measured on a scheduled build.**
-   `-kea-schedule` hoists `kea.trace` begin markers to the top of their queue,
-   so 10 of 52 TRACE regions in the shipped feature extractor open at cycle ~0.
-   The per-layer roofline is therefore the *unscheduled* build. A live compiler
-   bug; `docs/RESULTS.md` §3.1.
-6. Accuracy figures for the quantized graph itself (67.9% top-1 on a
+   scattered access — and the classifier, at 94.8% of attainable and 15.2 GB/s
+   of a 16 GB/s port, is where that would show first.
+4. **The `imem-budget` window is narrow and has a cliff.** Only ~19,100–21,000
+   is feasible at all. Below 20,000 the tiler makes too few, too large tiles for
+   the scheduler to overlap, and `--schedule` correctly declines — emitting
+   output byte-identical to not scheduling. The default sits at the measured
+   optimum. `docs/RESULTS.md` §6.2.
+5. Accuracy figures for the quantized graph itself (67.9% top-1 on a
    1000-image Imagenette split, *not* ImageNet-1k) live in `docs/FRONTEND.md`
    §8 with their own caveats. This repository's contribution is that the
    compiled artifact reproduces the reference **exactly**, not that the
@@ -184,9 +179,9 @@ the compiler's defaults** — no flags, nothing pinned.
 
 ### 4.1 Bugs found and fixed during bring-up
 
-Compiling a real network found four backend defects; all four are fixed, and
-`bash demo/regress/run_regressions.sh` asserts the *fixed* behaviour so they
-cannot silently come back.
+Compiling a real network found six backend defects; all six are fixed, and
+`bash demo/regress/run_regressions.sh` asserts the *fixed* behaviour — 11
+assertions — so they cannot silently come back.
 
 | | was | now |
 |---|---|---|
@@ -194,17 +189,12 @@ cannot silently come back.
 | activation-RHS `kea.matmul` | `error: null operand found`, pointing at nothing | a real diagnostic naming the op and the weight-stationary reason (the limitation itself stands) |
 | Rule D violation | `--kea-schedule` failed on any prefix past node 97 | the whole 52-convolution extractor schedules, and validates bit-exactly |
 | IMEM overrun | 41,409 instructions at the default reserve factor; the demo was pinned to `--spm-reserve 1` | `-kea-tile` is IMEM-aware; the extractor fits at the defaults with no flags |
+| standalone `kea.rescale` | no Level 2 lowering, so a scale-changing pool could not compile at all | lowered through a 16×16 identity matmul — **this is what puts the pool on the NPU** |
+| `kea.trace` marker hoisting | 10 of 52 TRACE regions opened at cycle ~0; per-layer numbers in a scheduled build were nonsense (Σ regions = 7.43× the program) | markers key on their own queue, bounded by a region lookahead; Σ regions = **1.072×**, checked on every build by `demo/common.py`'s own detector |
 
-Two of the four were *diagnosis* bugs rather than capability bugs — the
-compiler could already do more than it appeared to, and small reproducers were
-what showed that. Details in `docs/RESULTS.md` §3.
-
-Per-layer detail, the roofline plot and the full A/B table are in
-**[`docs/RESULTS.md`](docs/RESULTS.md)** and `demo/results/`.
-
-![roofline](demo/roofline_mobilenetv2.png)
-
----
+Half of them were *diagnosis* or *instrumentation* bugs rather than capability
+bugs — the compiler could already do more than it appeared to, and small
+reproducers were what showed that. Details in `docs/RESULTS.md` §3.
 
 ## 5. What the roofline says
 
@@ -213,25 +203,26 @@ it:
 
 | | arithmetic intensity | achieved | share of ops | share of layer-cycles | share of DRAM |
 |---|---|---|---|---|---|
-| conv (MXU), 35 layers | 18.6 – 74.5 ops/B | 99 – 316 GOPS | 90.9% | 73.2% | 62.8% |
-| 3×3 depthwise (DWU), 17 layers | **3.8 – 10.2 ops/B** | 35 – 78 GOPS | 8.7% | 23.3% | 31.8% |
-| classifier `fully_connected` | **2.0 ops/B** | 18.2 GOPS | 0.4% | 3.5% | 5.4% |
+| conv (MXU), 35 layers | 16.5 – 92.0 ops/B | 118 – 316 GOPS | 90.7% | 74.5% | 62.3% |
+| 3×3 depthwise (DWU), 17 layers | **3.6 – 10.0 ops/B** | 38 – 101 GOPS | 8.9% | 23.0% | 32.3% |
+| classifier `fully_connected` | **1.9 ops/B** | 29.2 GOPS | 0.4% | 2.5% | 5.3% |
 
-All 17 depthwise layers and the classifier fall below the ridge point, and so
-do ten of the convolutions — every one of them in the high-resolution front
-half: **28 of 53 layers are memory bound**. A depthwise 3×3 does 9 MACs per
-input element regardless of channel count, so its intensity is fixed by the
-kernel, not by the layer size; the classifier reads 1.28 MB of weights to do
+All 17 depthwise layers, the classifier and 13 of the convolutions fall below
+the ridge point: **31 of 53 layers are memory bound**. A depthwise 3×3 does 9
+MACs per input element regardless of channel count, so its intensity is fixed by
+the kernel, not by the layer size; the classifier reads 1.28 MB of weights to do
 1.28 M MACs and can never be anything but bandwidth limited. No amount of
 scheduling moves those points up; only fusing them into their neighbours (so
-the activation never round-trips through DRAM) would. The best layer in the
-network is the last 320→1280 pointwise at 7×7: **74.5 ops/byte, 315.9 GOPS,
-61.7% of attainable**.
+the activation never round-trips through DRAM) would.
 
-Layer points come from the unscheduled build (caveat 5 above); the two stars
-are the whole network before and after `--kea-schedule`.
+Two layers are worth naming. The last 320→1280 pointwise at 7×7 is the fastest
+in the network — **92.0 ops/byte, 316.4 GOPS**. And the classifier, the *least*
+efficient layer by MAC utilisation (5.7%), is the most efficient by the only
+measure that applies to it: **94.8% of attainable, 15.2 GB/s of a 16 GB/s
+port**. It is the one layer here that is genuinely finished.
 
----
+Layer points and both network points are the scheduled build; the two stars are
+the whole network before and after `--kea-schedule`.
 
 ## 6. Why text assembly: a DMA visibly overlapping a MATMUL
 
@@ -273,8 +264,8 @@ current one, **the VPU is requantizing the previous band's accumulator**,
 The unscheduled build of the same layer
 (`demo/results/schedule_excerpt.unscheduled.kasm`) issues every `DMA_LD` on
 DMA0, never touches DMA1, and puts a `WAIT` between every producer and
-consumer. It takes 102,764 cycles; the version above takes 53,114 — **1.935×**.
-Over the whole feature extractor the same mechanism is worth **1.174×**, and
+consumer. It takes 102,764 cycles; the version above takes 53,113 — **1.935×**.
+Over the whole feature extractor the same mechanism is worth **1.181×**, and
 `kea-sim` says the answer is still bit-identical.
 
 You cannot review that property in a binary, and you cannot unit-test it
@@ -290,7 +281,7 @@ compiler/             out-of-tree MLIR: the `kea` dialect, conversions,
   include/kea/        fuse/tile/schedule/alloc passes, the .kasm emitter
   lib/                    Dialect/ Conversion/ Transforms/ Target/Kasm
   tools/              kea-opt, kea-translate
-  test/               lit tests (34)
+  test/               lit tests (35)
 sim/                  the cycle-approximate simulator (functional + timing)
 runtime/              KEAF reader/writer, the .kasm assembler, kea-rt
 tools/                kea-as, kea-dis, kea-sim, keac  (+ keac's e2e tests)

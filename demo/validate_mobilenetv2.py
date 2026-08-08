@@ -7,9 +7,15 @@ input tensors and the exact int8 outputs of the numpy reference interpreter
 (``docs/FRONTEND.md`` section 4.1: *"assert exact integer equality; there is no
 tolerance"*).
 
+Both programs here are the **scheduled** builds at the compiler defaults, so
+this validates `-kea-schedule`'s output, not just the tiler's.
+
 The network runs on the simulator as two programs because its global average
-pool does not compile (see ``docs/RESULTS.md``).  So three things are measured
-separately and reported separately:
+pool does not compile: the head pool changes activation scale, the frontend
+therefore emits `tosa.avg_pool2d` followed by a `tosa.rescale`, and a rescale
+that is not attached to a contraction has no Level 2 lowering (see
+``docs/RESULTS.md`` section 3).  So three things are measured separately and
+reported separately:
 
 * **features** -- the simulator's `head` tensor vs the reference's `head`;
 * **classifier** -- the simulator fed the *reference's* `gap` vs the golden
@@ -140,9 +146,10 @@ def main() -> int:
             v["classifier_given_reference_pool"]["exact"] for v in every),
         "end_to_end_exact": all(v["end_to_end"]["exact"] for v in every),
         "argmax_agreement": sum(v["argmax_agrees"] for v in every),
+        "programs": "scheduled builds at the compiler defaults",
         "caveat": "the global average pool runs on the host with the "
-                  "frontend's reference kernel; it does not compile for the "
-                  "NPU (see docs/RESULTS.md)",
+                  "frontend's reference kernel; its trailing rescale has no "
+                  "Level 2 lowering (see docs/RESULTS.md)",
     }
     print("\nsummary: features exact=%s, classifier exact=%s, "
           "end-to-end exact=%s, argmax agreement %d/%d"

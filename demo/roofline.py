@@ -7,7 +7,18 @@ recomputed by hand except the two derived columns the JSON does not carry
 (``% of attainable`` is in the JSON as ``efficiency``; ``cycles`` share is
 arithmetic on ``cycles``).
 
-Inputs   demo/build/features.keaf, demo/build/classifier.keaf
+**Which build the per-layer table comes from, and why.**  `-kea-schedule`
+hoists a `kea.trace` begin marker to the top of its queue when nothing depends
+on it, so in a *scheduled* build some TRACE regions open at cycle ~0 and their
+`cycles` measure from program start rather than from the layer.  On the shipped
+feature extractor that corrupts 10 of 52 regions.  The per-layer table is
+therefore taken from the **unscheduled** build, where every region is sound;
+the whole-network headline is the **scheduled** build, which is what ships.
+`common.unsound_regions` checks this rather than trusting it, and the run fails
+if the unscheduled build ever develops the same problem.
+
+Inputs   demo/build/features.keaf + features_unsched.keaf,
+         demo/build/classifier.keaf + classifier_unsched.keaf
 Outputs  demo/results/roofline.json, demo/results/roofline_layers.csv,
          demo/roofline_mobilenetv2.png
 
@@ -39,7 +50,7 @@ GRID = "#dcdbd6"
 SURFACE = "#fcfcfb"
 
 
-def collect_layers(stats, kgraph_layers, tiling):
+def collect_layers(stats, kgraph_layers, tiling, sched_stats=None):
     """Join TRACE regions to kgraph layer names.
 
     `-kea-tile` numbers its layers in the order it lowers the Level 1
@@ -47,7 +58,12 @@ def collect_layers(stats, kgraph_layers, tiling):
     The Level 1 contractions are in the same order as the kgraph's contraction
     nodes, so region tag *i* is kgraph contraction *i*.  The tiling report's
     `op` field is used as a consistency check, not as the source of the name.
+
+    `sched_stats`, when given, contributes a `scheduled_cycles` column -- left
+    empty for the regions the scheduler's marker hoisting corrupts.
     """
+    bad_sched = set(C.unsound_regions(sched_stats)) if sched_stats else set()
+    sched = {r["tag"]: r for r in (sched_stats or {}).get("regions", [])}
     rows = []
     for r in sorted(stats["regions"], key=lambda x: x["tag"]):
         tag = r["tag"]
@@ -67,6 +83,8 @@ def collect_layers(stats, kgraph_layers, tiling):
             "node": lay.name,
             "op": lay.op,
             "cycles": r["cycles"],
+            "scheduled_cycles": ("" if tag in bad_sched or tag not in sched
+                                 else sched[tag]["cycles"]),
             "ops_useful": rf["ops_useful"],
             "ops_issued": rf["ops_issued"],
             "padding_efficiency": rf["padding_efficiency"],
@@ -109,6 +127,32 @@ def whole(stats, label):
         "matmuls": stats["global"]["mxu"]["matmuls"],
         "dwconvs": stats["global"]["dwu"]["dwconvs"],
     }
+
+
+def combine(programs, clock_hz, label, name):
+    """The two programs run back to back on one machine, so the compiled
+    network's aggregate is their sum."""
+    c = {"program": name, "label": label,
+         "cycles": sum(p["cycles"] for p in programs),
+         "ops_useful": sum(p["ops_useful"] for p in programs),
+         "ops_issued": sum(p["ops_issued"] for p in programs),
+         "dram_bytes": sum(p["dram_bytes"] for p in programs),
+         "dram_bytes_load": sum(p["dram_bytes_load"] for p in programs),
+         "dram_bytes_store": sum(p["dram_bytes_store"] for p in programs),
+         "peak_gops": programs[0]["peak_gops"],
+         "peak_dram_gb_per_s": programs[0]["peak_dram_gb_per_s"],
+         "ridge_point_ops_per_byte": programs[0]["ridge_point_ops_per_byte"]}
+    c["seconds"] = c["cycles"] / clock_hz
+    c["intensity_ops_per_byte"] = c["ops_useful"] / c["dram_bytes"]
+    c["achieved_gops"] = c["ops_useful"] / c["seconds"] / GOPS
+    c["attainable_gops"] = min(
+        c["peak_gops"], c["intensity_ops_per_byte"] * c["peak_dram_gb_per_s"])
+    c["pct_of_attainable"] = 100.0 * c["achieved_gops"] / c["attainable_gops"]
+    c["bound"] = ("MEMORY" if c["intensity_ops_per_byte"]
+                  < c["ridge_point_ops_per_byte"] else "COMPUTE")
+    c["padding_efficiency"] = c["ops_useful"] / c["ops_issued"]
+    c["dram_gb_per_s"] = c["dram_bytes"] / c["seconds"] / 1e9
+    return c
 
 
 def plot(rows, nets, path, peak_gops, peak_bw, ridge):
@@ -154,14 +198,34 @@ def plot(rows, nets, path, peak_gops, peak_bw, ridge):
                    label=LABEL[op] if op not in seen else None)
         seen.add(op)
 
-    for n in nets:
+    # the whole network, before and after -kea-schedule, with the move drawn
+    if len(nets) == 2:
+        ax.annotate("", xy=(nets[1]["intensity_ops_per_byte"],
+                            nets[1]["achieved_gops"]),
+                    xytext=(nets[0]["intensity_ops_per_byte"],
+                            nets[0]["achieved_gops"]),
+                    arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.2,
+                                    shrinkA=8, shrinkB=9), zorder=5)
+    for n, face, lab in zip(nets, ("#d8d7d2", "#ffffff"),
+                            (None, "whole network, unscheduled → scheduled")):
         ax.scatter(n["intensity_ops_per_byte"], n["achieved_gops"], s=230,
-                   marker="*", facecolor="#ffffff", edgecolor=INK,
-                   linewidth=1.6, zorder=6, label=n["label"])
-        ax.annotate(n["label"],
-                    xy=(n["intensity_ops_per_byte"], n["achieved_gops"]),
-                    xytext=(-15, -2), textcoords="offset points", ha="right",
-                    va="center", fontsize=8.5, color=INK)
+                   marker="*", facecolor=face, edgecolor=INK,
+                   linewidth=1.6, zorder=6, label=lab)
+    # the two stars share an x and are only 17% apart vertically, so they get
+    # one label between them rather than two that collide
+    lo_net = min(nets, key=lambda n: n["achieved_gops"])
+    hi_net = max(nets, key=lambda n: n["achieved_gops"])
+    ax.annotate("whole network\n%.2f → %.2f ms  (%.3f×)"
+                % (lo_net["seconds"] * 1e3, hi_net["seconds"] * 1e3,
+                   lo_net["cycles"] / float(hi_net["cycles"])),
+                xy=(hi_net["intensity_ops_per_byte"], hi_net["achieved_gops"]),
+                xytext=(-26, 26), textcoords="offset points", ha="right",
+                va="bottom", fontsize=8.5, color=INK, linespacing=1.4,
+                zorder=7,
+                # the compute roof passes through here; knock it out behind
+                # the glyphs rather than moving the label into the points
+                bbox=dict(boxstyle="round,pad=0.28", facecolor=SURFACE,
+                          edgecolor="none"))
 
     # direct labels on the extremes, which is where the story is
     lo = min(rows, key=lambda r: r["intensity_ops_per_byte"])
@@ -195,9 +259,11 @@ def plot(rows, nets, path, peak_gops, peak_bw, ridge):
         t.set_color(INK)
     fig.text(0.008, 0.012,
              "cycle-approximate; kea-sim counts are a lower bound "
-             "(docs/SIMULATOR.md section 2). 1 MAC = 2 ops.",
-             fontsize=7.2, color=INK2)
-    fig.tight_layout(rect=(0, 0.028, 1, 1))
+             "(docs/SIMULATOR.md §2). 1 MAC = 2 ops.\n"
+             "Layer points are the unscheduled build — see the TRACE region "
+             "caveat in docs/RESULTS.md §5.2.",
+             fontsize=7.2, color=INK2, linespacing=1.5)
+    fig.tight_layout(rect=(0, 0.055, 1, 1))
     fig.savefig(path, facecolor=SURFACE)
     print("wrote %s" % path)
 
@@ -205,32 +271,51 @@ def plot(rows, nets, path, peak_gops, peak_bw, ridge):
 def main() -> int:
     C.require_tools()
     C.ensure_dirs()
-    feat = os.path.join(C.BUILD, "features.keaf")
-    clf = os.path.join(C.BUILD, "classifier.keaf")
-    for p in (feat, clf):
+    keafs = {k: os.path.join(C.BUILD, k + ".keaf")
+             for k in ("features", "classifier",
+                       "features_unsched", "classifier_unsched")}
+    for p in keafs.values():
         if not os.path.exists(p):
-            raise SystemExit("run demo/compile_mobilenetv2.py first")
+            raise SystemExit("run demo/compile_mobilenetv2.py first (%s)" % p)
 
-    fstats_p = os.path.join(C.BUILD, "features.stats.json")
-    cstats_p = os.path.join(C.BUILD, "classifier.stats.json")
-    C.simulate(feat, stats_json=fstats_p)
-    C.simulate(clf, stats_json=cstats_p)
-    fstats, cstats = C.load_stats(fstats_p), C.load_stats(cstats_p)
+    st = {}
+    for k, p in keafs.items():
+        j = os.path.join(C.BUILD, k + ".stats.json")
+        C.simulate(p, stats_json=j)
+        st[k] = C.load_stats(j)
+
+    # The scheduler hoists TRACE begin markers; check both builds and say so.
+    region_health = {k: C.unsound_regions(v) for k, v in st.items()}
+    for k in ("features_unsched", "classifier_unsched"):
+        if region_health[k]:
+            raise SystemExit(
+                "TRACE regions in the unscheduled %s build are out of order "
+                "(tags %s); the per-layer table has no sound source" %
+                (k, region_health[k]))
+    if region_health["features"]:
+        print("note: %d of %d TRACE regions in the SCHEDULED feature "
+              "extractor open at program start (tags %s) -- -kea-schedule "
+              "hoists their begin markers. Per-layer cycles are taken from "
+              "the unscheduled build."
+              % (len(region_health["features"]), len(st["features"]["regions"]),
+                 region_health["features"]))
 
     g = KGraph.load(C.KGRAPH)
     groups = [l for l in C.layer_groups(g) if l.op in C.CONTRACTIONS]
     tiling = C.tiling_report(
         os.path.join(C.BUILD, "mobilenetv2_features.tosa.mlir"),
-        "mnv2_features", spm_reserve=1)
+        "mnv2_features")
 
-    rows = collect_layers(fstats, groups, tiling)
+    rows = collect_layers(st["features_unsched"], groups, tiling,
+                          sched_stats=st["features"])
 
     # the classifier is its own program, so it contributes one whole-program
     # point rather than a region.
-    crf = cstats["global"]["roofline"]
+    crf = st["classifier_unsched"]["global"]["roofline"]
     rows.append({
         "layer": len(rows), "node": "fc#182", "op": "fully_connected",
-        "cycles": cstats["total_cycles"],
+        "cycles": st["classifier_unsched"]["total_cycles"],
+        "scheduled_cycles": st["classifier"]["total_cycles"],
         "ops_useful": crf["ops_useful"], "ops_issued": crf["ops_issued"],
         "padding_efficiency": crf["padding_efficiency"],
         "dram_bytes": crf["dram_bytes"],
@@ -239,64 +324,64 @@ def main() -> int:
         "attainable_gops": crf["attainable_ops_per_s"] / GOPS,
         "pct_of_attainable": 100.0 * crf["efficiency"],
         "bound": "MEMORY" if crf["memory_bound"] else "COMPUTE",
-        "mxu_mac_utilization": cstats["global"]["mxu"]["mac_utilization"],
-        "dwu_mac_utilization": cstats["global"]["dwu"]["mac_utilization"],
+        "mxu_mac_utilization":
+            st["classifier_unsched"]["global"]["mxu"]["mac_utilization"],
+        "dwu_mac_utilization":
+            st["classifier_unsched"]["global"]["dwu"]["mac_utilization"],
     })
 
-    programs = [whole(fstats, "features (52 conv layers)"),
-                whole(cstats, "classifier (fully_connected)")]
+    programs = [whole(st["features"], "features (52 conv layers), scheduled"),
+                whole(st["classifier"], "classifier (fully_connected), "
+                                        "scheduled"),
+                whole(st["features_unsched"], "features, unscheduled"),
+                whole(st["classifier_unsched"], "classifier, unscheduled")]
 
-    # The two programs run back to back on the same machine, so the compiled
-    # network's aggregate is their sum.  The global average pool between them
-    # does not compile and is NOT counted here (62,720 additions, 0.01% of the
-    # network's arithmetic -- see docs/RESULTS.md section 3).
-    comb = {
-        "program": "whole compiled network = features + classifier",
-        "label": "whole network",
-        "cycles": sum(p["cycles"] for p in programs),
-        "ops_useful": sum(p["ops_useful"] for p in programs),
-        "ops_issued": sum(p["ops_issued"] for p in programs),
-        "dram_bytes": sum(p["dram_bytes"] for p in programs),
-        "peak_gops": programs[0]["peak_gops"],
-        "peak_dram_gb_per_s": programs[0]["peak_dram_gb_per_s"],
-        "ridge_point_ops_per_byte": programs[0]["ridge_point_ops_per_byte"],
-    }
-    comb["seconds"] = comb["cycles"] / fstats["clock_hz"]
-    comb["intensity_ops_per_byte"] = comb["ops_useful"] / comb["dram_bytes"]
-    comb["achieved_gops"] = comb["ops_useful"] / comb["seconds"] / GOPS
-    comb["attainable_gops"] = min(
-        comb["peak_gops"],
-        comb["intensity_ops_per_byte"] * comb["peak_dram_gb_per_s"])
-    comb["pct_of_attainable"] = 100.0 * comb["achieved_gops"] / comb["attainable_gops"]
-    comb["bound"] = ("MEMORY" if comb["intensity_ops_per_byte"]
-                     < comb["ridge_point_ops_per_byte"] else "COMPUTE")
-    comb["padding_efficiency"] = comb["ops_useful"] / comb["ops_issued"]
-    comb["mxu_mac_utilization"] = (
-        (fstats["global"]["mxu"]["macs_useful"]
-         + cstats["global"]["mxu"]["macs_useful"])
-        / (comb["cycles"] * 256.0))
-    nets = [comb]
+    hz = st["features"]["clock_hz"]
+    # The global average pool between the two programs does not compile and is
+    # NOT counted here (62,720 additions, 0.01% of the network's arithmetic --
+    # see docs/RESULTS.md section 3).
+    comb = combine(programs[:2], hz, "whole network (scheduled)",
+                   "whole compiled network = features + classifier, scheduled")
+    comb_u = combine(programs[2:], hz, "unscheduled",
+                     "whole compiled network, unscheduled")
+    for c, a, b in ((comb, st["features"], st["classifier"]),
+                    (comb_u, st["features_unsched"], st["classifier_unsched"])):
+        c["mxu_mac_utilization"] = (
+            (a["global"]["mxu"]["macs_useful"]
+             + b["global"]["mxu"]["macs_useful"]) / (c["cycles"] * 256.0))
+        c["dwu_mac_utilization"] = (
+            (a["global"]["dwu"]["macs_useful"]
+             + b["global"]["dwu"]["macs_useful"]) / (c["cycles"] * 128.0))
+    comb["speedup_over_unscheduled"] = comb_u["cycles"] / float(comb["cycles"])
+    nets = [comb_u, comb]
 
     region_cycles = sum(r["cycles"] for r in rows[:-1])
     out = {
         "whole_network": comb,
+        "whole_network_unscheduled": comb_u,
         "programs": programs,
         "layers": rows,
+        "layer_source_build": "unscheduled",
+        "scheduled_regions_unsound": region_health["features"],
         "layer_cycle_sum": region_cycles,
         "layer_cycle_overlap_pct":
-            100.0 * (region_cycles - fstats["total_cycles"]) / fstats["total_cycles"],
+            100.0 * (region_cycles - st["features_unsched"]["total_cycles"])
+            / st["features_unsched"]["total_cycles"],
         "memory_bound_layers": [r["layer"] for r in rows if r["bound"] == "MEMORY"],
         "note": "TRACE regions cover every unit active inside their cycle "
                 "window, and consecutive layers overlap, so per-layer cycles "
-                "sum to more than the program total.",
+                "sum to more than the program total. Per-layer rows come from "
+                "the unscheduled build because -kea-schedule hoists some TRACE "
+                "begin markers to program start.",
     }
     C.write_json(os.path.join(C.RESULTS, "roofline.json"), out)
 
     csv = os.path.join(C.RESULTS, "roofline_layers.csv")
-    cols = ["layer", "node", "op", "cycles", "ops_useful", "ops_issued",
-            "padding_efficiency", "dram_bytes", "intensity_ops_per_byte",
-            "achieved_gops", "attainable_gops", "pct_of_attainable", "bound",
-            "mxu_mac_utilization", "dwu_mac_utilization"]
+    cols = ["layer", "node", "op", "cycles", "scheduled_cycles", "ops_useful",
+            "ops_issued", "padding_efficiency", "dram_bytes",
+            "intensity_ops_per_byte", "achieved_gops", "attainable_gops",
+            "pct_of_attainable", "bound", "mxu_mac_utilization",
+            "dwu_mac_utilization"]
     with open(csv, "w") as f:
         f.write(",".join(cols) + "\n")
         for r in rows:

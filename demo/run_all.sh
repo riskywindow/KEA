@@ -11,8 +11,11 @@
 # Everything it writes lands in demo/build/ (intermediates, ~230 MB with the A/B
 # sweep) and demo/results/ (the numbers, committed).
 #
-# Runtime: about 90 seconds, dominated by the 52-layer scheduled/unscheduled
-# A/B sweep. Pass --quick to skip it.
+# Everything runs at the compiler's defaults -- spm-reserve-factor 1,
+# imem-budget 20480, -kea-schedule mode=auto. Nothing is pinned.
+#
+# Runtime: about 2 minutes, dominated by the scheduler A/B (whole network, an
+# imem-budget sweep and 53 layers). Pass --quick to skip it.
 #===----------------------------------------------------------------------===#
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,8 +47,8 @@ if [[ ${QUICK} -eq 0 ]]; then
 fi
 
 echo
-echo "############ 5. backend defects, still reproducing?"
-bash "${ROOT}/demo/repro/run_repro.sh" || true
+echo "############ 5. regression tests for the four defects fixed in bring-up"
+bash "${ROOT}/demo/regress/run_regressions.sh"
 
 # A canonical excerpt for README.md: the scheduled stream where a DMA of the
 # next tile sits between two MATMULs of the current one.

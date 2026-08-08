@@ -148,6 +148,7 @@
   "classifier_exact": true,
   "end_to_end_exact": true,
   "argmax_agreement": 4,
-  "caveat": "the global average pool runs on the host with the frontend's reference kernel; it does not compile for the NPU (see docs/RESULTS.md)"
+  "programs": "scheduled builds at the compiler defaults",
+  "caveat": "the global average pool runs on the host with the frontend's reference kernel; its trailing rescale has no Level 2 lowering (see docs/RESULTS.md)"
  }
 }

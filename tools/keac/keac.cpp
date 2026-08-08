@@ -50,6 +50,9 @@ const char *kUsage =
     "      --pipeline <passes> override the kea-opt pass list\n"
     "      --schedule          insert --kea-schedule into the pipeline\n"
     "      --spm-reserve <n>   -kea-tile=spm-reserve-factor=<n>\n"
+    "      --imem-budget <n>   -kea-tile=imem-budget=<n>: the whole-function\n"
+    "                          instruction budget the tiler plans against\n"
+    "                          (default 20480 of the 32768 IMEM holds)\n"
     "      --sync <mode>       kea-translate --sync=auto|insert|none\n"
     "      --io-quant <spec>   <tensor>=<scale>[,<zp>], repeatable\n"
     "      --annotate          annotate the .kasm (implies keeping it)\n"
@@ -166,7 +169,7 @@ bool endsWith(const std::string &s, const char *suffix) {
 
 int main(int argc, char **argv) {
   std::string input, output, function, pipelineOverride, emit = "keaf";
-  std::string syncMode, spmReserve;
+  std::string syncMode, spmReserve, imemBudget;
   std::string optPath, translatePath, asPath;
   std::vector<std::string> ioQuant;
   bool keep = false, schedule = false, annotate = false, strip = false;
@@ -198,6 +201,8 @@ int main(int argc, char **argv) {
       schedule = true;
     } else if (a == "--spm-reserve") {
       spmReserve = needValue(i);
+    } else if (a == "--imem-budget") {
+      imemBudget = needValue(i);
     } else if (a == "--sync") {
       syncMode = needValue(i);
     } else if (a == "--io-quant") {
@@ -287,9 +292,15 @@ int main(int argc, char **argv) {
   } else {
     cmd.push_back("--tosa-to-kea");
     cmd.push_back("--kea-fuse");
-    cmd.push_back(spmReserve.empty()
-                      ? std::string("--kea-tile")
-                      : "--kea-tile=spm-reserve-factor=" + spmReserve);
+    // `-pass=a=1 b=2` -- MLIR splits a single pass argument on whitespace, and
+    // runCommand passes it as one argv element, so the spaces survive.
+    std::string tileOpts;
+    if (!spmReserve.empty())
+      tileOpts = "spm-reserve-factor=" + spmReserve;
+    if (!imemBudget.empty())
+      tileOpts += (tileOpts.empty() ? "" : " ") + ("imem-budget=" + imemBudget);
+    cmd.push_back(tileOpts.empty() ? std::string("--kea-tile")
+                                   : "--kea-tile=" + tileOpts);
     if (schedule)
       cmd.push_back("--kea-schedule");
     cmd.push_back("--kea-alloc");

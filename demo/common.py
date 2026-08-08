@@ -122,13 +122,37 @@ def emit_tosa(out_path: str, function: str, first: Optional[int] = None,
 
 def compile_keaf(mlir_path: str, function: str, out_keaf: str,
                  schedule: bool = False, spm_reserve: Optional[int] = None,
+                 imem_budget: Optional[int] = None,
+                 schedule_mode: Optional[str] = None,
                  check: bool = True, emit: Optional[str] = None) -> Run:
+    """Run `keac`.
+
+    Everything is at the compiler's defaults unless a keyword says otherwise:
+    `spm-reserve-factor = 1`, `imem-budget = 20480`, `-kea-schedule mode=auto`.
+    `schedule_mode` forces the mode and implies `--schedule`; it exists so the
+    A/B can measure `mode=serial`, which is the pass's own control.
+    """
     cmd = [KEAC, mlir_path, "--function", function, "-o", out_keaf,
            "--keep-intermediates"]
-    if spm_reserve is not None:
-        cmd += ["--spm-reserve", str(spm_reserve)]
-    if schedule:
-        cmd += ["--schedule"]
+    if schedule_mode is not None:
+        # `--schedule` hard-codes a bare `--kea-schedule`; forcing a mode needs
+        # the explicit pass list, so build the whole thing here instead.
+        opts = []
+        if spm_reserve is not None:
+            opts.append("spm-reserve-factor=%d" % spm_reserve)
+        if imem_budget is not None:
+            opts.append("imem-budget=%d" % imem_budget)
+        tile = "--kea-tile" + ("=" + " ".join(opts) if opts else "")
+        cmd += ["--pipeline",
+                "--tosa-to-kea --kea-fuse %s --kea-schedule=mode=%s "
+                "--kea-alloc" % (tile, schedule_mode)]
+    else:
+        if spm_reserve is not None:
+            cmd += ["--spm-reserve", str(spm_reserve)]
+        if imem_budget is not None:
+            cmd += ["--imem-budget", str(imem_budget)]
+        if schedule:
+            cmd += ["--schedule"]
     if emit:
         cmd += ["--emit", emit]
     return run(cmd, check=check)
@@ -219,17 +243,20 @@ def layer_groups(g) -> List[Layer]:
 
 
 def tiling_report(mlir_path: str, function: str,
-                  spm_reserve: int = 1) -> List[Dict]:
+                  imem_budget: Optional[int] = None) -> List[Dict]:
     """`-kea-tile=report-tiles=true`'s `kea.tiling`, as a list of dicts.
 
     This is the only way to learn which `-kea-tile` layer id corresponds to
     which op kind, which is what turns a TRACE region tag into a layer name.
+    Runs at the pass defaults so the tiling it reports is the shipped one.
     """
     kea_opt = os.path.join(ROOT, "build", "compiler", "bin", "kea-opt")
     out = os.path.join(BUILD, os.path.basename(mlir_path) + ".tiled.mlir")
+    opts = ["report-tiles=true"]
+    if imem_budget is not None:
+        opts.append("imem-budget=%d" % imem_budget)
     run([kea_opt, mlir_path, "--tosa-to-kea", "--kea-fuse",
-         "--kea-tile=spm-reserve-factor=%d report-tiles=true" % spm_reserve,
-         "-o", out])
+         "--kea-tile=" + " ".join(opts), "-o", out])
     text = open(out).read()
     m = re.search(r"kea\.tiling = \[(.*?)\]\}?\s*\{", text, re.S)
     if not m:
@@ -243,6 +270,29 @@ def tiling_report(mlir_path: str, function: str,
         if "layer" in d:
             entries.append(d)
     return entries
+
+
+def unsound_regions(stats: Dict) -> List[int]:
+    """TRACE regions whose `begin` was not issued where its layer starts.
+
+    `-kea-schedule` hoists a `kea.trace` begin marker to the top of its queue
+    when nothing depends on it, so in a scheduled build some regions open at
+    cycle ~0 and their `cycles` measure from program start instead of from the
+    layer.  A region is called unsound here when it strictly contains another
+    region that starts earlier -- i.e. `depth > 0` for a region that is not
+    itself nested by construction.  Concretely: any region that begins before
+    the region with the previous tag ends *and* spans it entirely.
+
+    Returns the tags, so a caller can refuse to report those layers rather
+    than quietly summing nonsense.
+    """
+    rs = sorted(stats.get("regions", []), key=lambda r: r["tag"])
+    bad = []
+    for i, r in enumerate(rs):
+        earlier = [q for q in rs[:i] if q["begin_cycle"] > r["begin_cycle"]]
+        if earlier:
+            bad.append(r["tag"])
+    return bad
 
 
 def load_stats(path: str) -> Dict:

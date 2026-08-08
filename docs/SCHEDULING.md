@@ -287,7 +287,7 @@ use.
 **It has fired, once, and the argument above was wrong in exactly one place.**
 Every lowerable prefix of MobileNetV2 at or beyond node 99 failed it, while the
 same prefix without `--schedule` compiled cleanly, and the threshold moved with
-`spm-reserve-factor` (`demo/repro/run_repro.sh` defect 3). Program length, not
+`spm-reserve-factor` (`demo/regress/run_regressions.sh` case 3 — since fixed). Program length, not
 any particular layer. The mechanism, in three steps:
 
 1. §6.2's rotation edges are added *inside* the capacity fixpoint, after the
@@ -557,7 +557,7 @@ emits the in-order plan, which is why the two rows above read 1.002× instead of
 than the emitter's.
 
 The demo is pinned to `--spm-reserve 1` only because the whole feature extractor
-overruns IMEM at reserve 2 (`demo/repro/run_repro.sh` defect 4, a `-kea-tile`
+overruns IMEM at reserve 2 (`demo/regress/run_regressions.sh` case 4 — since fixed, a `-kea-tile`
 instruction-count problem). **Fixing that unlocks the 1.5× on the whole
 network**; it is the single highest-value item left in the backend.
 
@@ -707,7 +707,7 @@ Stated plainly rather than stubbed.
 * **The IMEM ceiling is what is costing the whole-network speedup.** §8.1.1: at
   `--spm-reserve 1` the scheduler correctly declines, and at 2 or 3 it is worth
   1.48–1.64× — but the whole feature extractor only fits in IMEM at reserve 1
-  (`demo/repro/run_repro.sh` defect 4). **The fix belongs in `-kea-tile`**, and
+  (`demo/regress/run_regressions.sh` case 4 — since fixed). **The fix belongs in `-kea-tile`**, and
   it is the highest-value item left in the backend.
 * **Regions overlap after software pipelining.** §7. Bounded now, but still
   worth knowing before reading a per-layer roofline.

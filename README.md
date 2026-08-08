@@ -89,7 +89,7 @@ on 21+), a C++17 compiler, and the venv described in `docs/PLATFORM.md`.
 
 ```sh
 source scripts/env.sh
-bash scripts/build_compiler.sh     # kea-opt, kea-translate + 32 tests   (~6 min)
+bash scripts/build_compiler.sh     # kea-opt, kea-translate + 34 lit tests (~6 min)
 bash scripts/build.sh              # kea-as, kea-dis, kea-sim, kea-rt, keac + 17 tests
 .venv/bin/python -m pytest frontend/tests        # 92 tests
 .venv/bin/python tools/keac/tests/numeric_check.py   # 7 layouts, bit-exact
@@ -99,10 +99,10 @@ The end-to-end demo — emit TOSA from the quantized graph, compile, simulate,
 validate against golden vectors, and produce the roofline:
 
 ```sh
-bash demo/run_all.sh          # ~90 s;  --quick skips the 52-layer A/B sweep
+bash demo/run_all.sh          # ~2 min;  --quick skips the scheduler A/B
 ```
 
-Compiling one model by hand:
+Compiling one model by hand — no flags are needed; the defaults fit:
 
 ```sh
 # .kgraph.json -> TOSA MLIR
@@ -112,64 +112,92 @@ cd frontend && ../.venv/bin/python -m kea_frontend.tosa_emit \
 
 # TOSA -> .keaf, then run it
 build/native/bin/keac /tmp/m.tosa.mlir --function mnv2 -o /tmp/m.keaf \
-    --spm-reserve 1 --keep-intermediates
+    --schedule --keep-intermediates
 build/native/bin/kea-sim /tmp/m.keaf --stats-json /tmp/m.stats.json
 ```
+
+`keac --imem-budget <n>` exposes the tiler's whole-function instruction budget
+(default 20480 of the 32768 IMEM holds). It is the knob that picks the tiling,
+and therefore the cycle count — see `docs/RESULTS.md` §6.2 for the measured
+curve.
 
 ---
 
 ## 4. Headline numbers, and the caveats that go with them
 
 **MobileNetV2 int8, 224×224, batch 1**, `models/mobilenetv2_int8.kgraph.json`
-(torchvision `IMAGENET1K_V1`, percentile observer, BN folded).
+(torchvision `IMAGENET1K_V1`, percentile observer, BN folded). **Everything at
+the compiler's defaults** — no flags, nothing pinned.
 
 | | |
 |---|---|
 | Nodes compiled and run | **182 of 183** (the global average pool does not compile — see below) |
-| Convolutions | **52 of 52** |
-| Total cycles | **3,375,173** = 3.38 ms at 1 GHz |
+| Convolutions | **52 of 52**, all scheduled |
+| Total cycles | **3,316,341** = 3.32 ms at 1 GHz (3,868,452 unscheduled) |
+| Instructions | 40,937 across two programs, against a 32,768-entry IMEM |
 | Useful arithmetic | 601.5 Mops (300.8 M MACs) |
-| DRAM moved | 18.6 MB (11.9 MB read, 6.7 MB written) |
-| Arithmetic intensity | **32.3 ops/byte** — right on the 32.0 ridge point |
-| Achieved | **178.2 GOPS** of 512 attainable = **34.8%** |
-| MXU MAC utilisation | **32.4%** of the 256 int8 MAC/cycle peak |
+| DRAM moved | 22.9 MB (16.2 MB read, 6.7 MB written) |
+| Arithmetic intensity | **26.3 ops/byte** — below the 32.0 ridge point, so **memory bound** |
+| Achieved | **181.4 GOPS** of 420.2 attainable = **43.2%** |
+| MXU MAC utilisation | **33.0%** of the 256 int8 MAC/cycle peak |
 | MXU padding efficiency | 93.3% (useful ÷ issued MACs) |
-| Numerical result | **bit-exact** vs the numpy reference on all 4 golden vectors, 4/4 argmax agreement |
-| `--kea-schedule` A/B | **1.267×** over 53 layers compiled individually — but **0.951×** on the one 28-layer program it could be measured on |
+| Numerical result | **bit-exact** vs the numpy reference on all 4 golden vectors, 4/4 argmax agreement — on the *scheduled* build |
+| `--kea-schedule` A/B | **1.174×** on the whole 52-convolution feature extractor; 1.166× on the whole compiled network |
 
 **Caveats, in order of how much they matter.**
 
-1. **The global average pool does not compile.** `-kea-tile` gives a pool's
-   SPM_A tile the same buffer name as the DRAM buffer holding the pool's
-   result, and `kea-translate` rejects duplicate names — so *every* `kea.pool`
-   fails, in every program. The demo therefore runs the network as **two**
-   `.keaf` programs with that one node executed on the host by the frontend's
-   own reference kernel, and says so everywhere it reports a number. That node
-   is 62,720 additions, 0.01% of the network's arithmetic, but it is not
-   running on the NPU and the result is not a single-program inference.
-   Reproducer: `demo/repro/pool_dram_name_collision.mlir`.
+1. **MobileNetV2 does not fit in one program, and cannot.** At the coarsest
+   tiling of every layer it is **36,633 KEA-1 instructions against a 32,768
+   entry IMEM — 11.8% over**. That is a capacity result, not a bug: the machine
+   is branchless, so program size is a hard limit. Separately, the head pool
+   changes activation scale, and a `tosa.rescale` that is not attached to a
+   contraction has no Level 2 lowering — so the pool runs **on the host** with
+   the frontend's own reference kernel and the demo ships **two** `.keaf`
+   programs. That node is 62,720 additions, 0.01% of the network's arithmetic,
+   but it is not running on the NPU and this is not a single-program inference.
+   Both blockers are measured in `docs/RESULTS.md` §2.1.
 2. **`kea-sim` cycle counts are a lower bound.** Scratchpad port arbitration,
    DRAM row buffers, refresh and turnaround, and misalignment costs are all
    unmodelled (`docs/SIMULATOR.md` §2). Real LPDDR would cost 10–30% more on
    scattered access.
-3. **The default SPM reserve factor does not fit.** At `spm-reserve-factor = 2`
-   the feature extractor is **41,409 instructions** against a 32,768-instruction
-   IMEM. At `--spm-reserve 1` it is **30,773** and fits, at the cost of larger
-   tiles and less headroom for cross-layer double buffering. The demo uses
-   `--spm-reserve 1` and reports both counts.
-4. **`--kea-schedule` fails on the whole network**, and where it does run over
-   many layers it is a regression. It produces a Rule D violation
-   (`docs/ISA.md` §5.5) on any lowerable prefix of this model past node 97, so
-   the A/B is measured **per layer** (1.267× aggregate, best 1.971×, two layers
-   regress). On the largest prefix it does accept — 28 convolutions — it is
-   **0.951×**, i.e. 5% slower than not scheduling at all. Both numbers are in
-   `docs/RESULTS.md` §6; the per-layer one alone would be misleading.
-   Reproducer: `demo/repro/run_repro.sh`, defect 3.
-5. Accuracy figures for the quantized graph itself (67.9% top-1 on a
+3. **The IMEM-aware tiler trades bandwidth for instructions, and it shows.**
+   Against the previously recorded greedy-tiling build it moves **22.9% more
+   DRAM bytes** and pushes the network from just above the ridge point to
+   memory bound. Scheduling more than pays that back — but the tiler is
+   optimising instructions against a modelled cycle cost that is evidently not
+   tracking DRAM traffic. `docs/RESULTS.md` §5.1 has the side-by-side.
+4. **The `imem-budget` knob is narrow and its curve is not monotonic.** Only
+   about 19,100–21,300 is feasible at all, and the measured optimum is
+   `--imem-budget 20200` at **3,130,202** cycles, 1.44% under the default. At
+   the two tightest budgets `--schedule` is a **6% regression** against not
+   scheduling. `docs/RESULTS.md` §6.2.
+5. **Per-layer cycles cannot be measured on a scheduled build.**
+   `-kea-schedule` hoists `kea.trace` begin markers to the top of their queue,
+   so 10 of 52 TRACE regions in the shipped feature extractor open at cycle ~0.
+   The per-layer roofline is therefore the *unscheduled* build. A live compiler
+   bug; `docs/RESULTS.md` §3.1.
+6. Accuracy figures for the quantized graph itself (67.9% top-1 on a
    1000-image Imagenette split, *not* ImageNet-1k) live in `docs/FRONTEND.md`
    §8 with their own caveats. This repository's contribution is that the
    compiled artifact reproduces the reference **exactly**, not that the
    reference is accurate.
+
+### 4.1 Bugs found and fixed during bring-up
+
+Compiling a real network found four backend defects; all four are fixed, and
+`bash demo/regress/run_regressions.sh` asserts the *fixed* behaviour so they
+cannot silently come back.
+
+| | was | now |
+|---|---|---|
+| `kea.pool` name collision | every pool untranslatable — a DRAM name and an SPM_A tile name collided | uniquification moved into `makeBuffer()`; a 7×7 pool runs in **460 cycles** at 42.6% VPU |
+| activation-RHS `kea.matmul` | `error: null operand found`, pointing at nothing | a real diagnostic naming the op and the weight-stationary reason (the limitation itself stands) |
+| Rule D violation | `--kea-schedule` failed on any prefix past node 97 | the whole 52-convolution extractor schedules, and validates bit-exactly |
+| IMEM overrun | 41,409 instructions at the default reserve factor; the demo was pinned to `--spm-reserve 1` | `-kea-tile` is IMEM-aware; the extractor fits at the defaults with no flags |
+
+Two of the four were *diagnosis* bugs rather than capability bugs — the
+compiler could already do more than it appeared to, and small reproducers were
+what showed that. Details in `docs/RESULTS.md` §3.
 
 Per-layer detail, the roofline plot and the full A/B table are in
 **[`docs/RESULTS.md`](docs/RESULTS.md)** and `demo/results/`.
@@ -185,60 +213,69 @@ it:
 
 | | arithmetic intensity | achieved | share of ops | share of layer-cycles | share of DRAM |
 |---|---|---|---|---|---|
-| 1×1 pointwise conv (MXU), 35 layers | 20.0 – 90.0 ops/B | 117 – 324 GOPS | 91.5% | 72.1% | 58.8% |
-| 3×3 depthwise (DWU), 17 layers | **3.7 – 10.0 ops/B** | 35 – 78 GOPS | 8.1% | 23.9% | 34.6% |
-| classifier `fully_connected` | **1.9 ops/B** | 17.9 GOPS | 0.4% | 4.0% | 6.6% |
+| conv (MXU), 35 layers | 18.6 – 74.5 ops/B | 99 – 316 GOPS | 90.9% | 73.2% | 62.8% |
+| 3×3 depthwise (DWU), 17 layers | **3.8 – 10.2 ops/B** | 35 – 78 GOPS | 8.7% | 23.3% | 31.8% |
+| classifier `fully_connected` | **2.0 ops/B** | 18.2 GOPS | 0.4% | 3.5% | 5.4% |
 
 All 17 depthwise layers and the classifier fall below the ridge point, and so
-do six of the pointwise convolutions: **24 of 53 layers are memory bound**. A
-depthwise 3×3 does 9 MACs
-per input element regardless of channel count, so its intensity is fixed by the
+do ten of the convolutions — every one of them in the high-resolution front
+half: **28 of 53 layers are memory bound**. A depthwise 3×3 does 9 MACs per
+input element regardless of channel count, so its intensity is fixed by the
 kernel, not by the layer size; the classifier reads 1.28 MB of weights to do
 1.28 M MACs and can never be anything but bandwidth limited. No amount of
 scheduling moves those points up; only fusing them into their neighbours (so
-the activation never round-trips through DRAM) would.
+the activation never round-trips through DRAM) would. The best layer in the
+network is the last 320→1280 pointwise at 7×7: **74.5 ops/byte, 315.9 GOPS,
+61.7% of attainable**.
+
+Layer points come from the unscheduled build (caveat 5 above); the two stars
+are the whole network before and after `--kea-schedule`.
 
 ---
 
 ## 6. Why text assembly: a DMA visibly overlapping a MATMUL
 
-This is `demo/results/schedule_excerpt.kasm` lines 42–58, the scheduled stream
+This is `demo/results/schedule_excerpt.kasm` lines 46–65, the scheduled stream
 for one 112×112 pointwise convolution. Long operand lists are wrapped and a few
-stride fields elided as `…`; nothing is reordered. Three things are happening at
-once: **DMA1 is storing the previous row band**,
-**DMA0 is loading the next one** — between the two `MATMUL`s of the current one
-— and `LOAD_W` alternates `bank=0` / `bank=1` so a weight load never waits for
-the array:
+stride fields elided as `…`; nothing is reordered. Four things are happening at
+once: **DMA1 is loading the next row band** *between* the two `MATMUL`s of the
+current one, **the VPU is requantizing the previous band's accumulator**,
+**DMA0 is storing the band before that**, and `LOAD_W` alternates
+`bank=0` / `bank=1` so a weight load never waits for the array:
 
 ```
-  DMA1  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out, spm_addr=a:172080,   <- previous band out
-                len0=16, n1=112, n2=16, dram_s1=16, dram_s2=1792, spm_s1=16, spm_s2=1792
-  DMA1  SIGNAL  event=8, inc=1
   MXU   WAIT    event=3, threshold=1
-  MXU   WAIT    event=0, threshold=1
-  MXU   MATMUL  a_addr=a:57360, a_inner_stride=32, a_outer_stride=3584, m_inner=112,
-                m_outer=16, acc_addr=acc:0, …, bank=0, acc_mode=overwrite, dtype=int8
-  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
-  DMA0  WAIT    event=7, threshold=1
-  DMA0  WAIT    event=2, threshold=1
-  DMA0  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+114688,               <- next band in,
-                spm_addr=a:114720, len0=3584, n1=16, n2=1, dram_s1=3584, …          mid-MATMUL
-  DMA0  SIGNAL  event=0, inc=1
-  MXU   MATMUL  a_addr=a:57376, a_inner_stride=32, a_outer_stride=3584, m_inner=112,
-                m_outer=16, acc_addr=acc:0, …, bank=1, acc_mode=accumulate, dtype=int8
-  MXU   SIGNAL  event=5, inc=1
-  MXU   SIGNAL  event=6, inc=1
-  MXU   SIGNAL  event=7, inc=1
+  MXU   WAIT    event=4, threshold=1
   MXU   LOAD_W  w_addr=w:0, w_row_stride=16, k_rows=16, n_cols=16, bank=0, dtype=int8
+  MXU   MATMUL  a_addr=a:28688, a_inner_stride=32, a_outer_stride=3584, m_inner=112,
+                m_outer=8, acc_addr=acc:14336, …, bank=0, acc_mode=overwrite, dtype=int8
+  DMA1  WAIT    event=2, threshold=1
+  DMA1  DMA_LD  spm_space=SPM_A, dram_addr=@slice_6_7.input0+86016,               <- next band in,
+                spm_addr=a:86064, len0=3584, n1=8, n2=1, dram_s1=3584, …            mid-MATMUL
+  DMA1  SIGNAL  event=4, inc=1
   VPU   WAIT    event=5, threshold=1
-  VPU   VQUANT  acc_addr=acc:0, out_addr=a:200768, qparam_addr=w:512, num_pixels=1792,
-                channels=16, …, out_zp=-5, clamp_lo=-128, clamp_hi=127, dtype=int8
+  VPU   WAIT    event=6, threshold=1
+  VPU   VQUANT  acc_addr=acc:0, out_addr=a:172128, qparam_addr=w:512,             <- previous band's
+                num_pixels=896, channels=16, …, out_zp=-5, dtype=int8                accumulator
+  VPU   SIGNAL  event=3, inc=1
+  VPU   SIGNAL  event=1, inc=1
+  MXU   LOAD_W  w_addr=w:256, w_row_stride=16, k_rows=16, n_cols=16, bank=1, dtype=int8
+  MXU   MATMUL  a_addr=a:28704, a_inner_stride=32, a_outer_stride=3584, m_inner=112,
+                m_outer=8, acc_addr=acc:14336, …, bank=1, acc_mode=accumulate, dtype=int8
+  MXU   SIGNAL  event=5, inc=1
+  MXU   SIGNAL  event=7, inc=1
+  DMA0  WAIT    event=7, threshold=1
+  DMA0  WAIT    event=1, threshold=1
+  DMA0  DMA_ST  spm_space=SPM_A, dram_addr=@slice_6_7.0.out, spm_addr=a:172128,   <- band before that
+                len0=16, n1=112, n2=8, dram_s1=16, dram_s2=1792, …                   out
 ```
 
 The unscheduled build of the same layer
 (`demo/results/schedule_excerpt.unscheduled.kasm`) issues every `DMA_LD` on
 DMA0, never touches DMA1, and puts a `WAIT` between every producer and
-consumer. It takes 103,023 cycles; the version above takes 56,030 — **1.84×**.
+consumer. It takes 102,764 cycles; the version above takes 53,114 — **1.935×**.
+Over the whole feature extractor the same mechanism is worth **1.174×**, and
+`kea-sim` says the answer is still bit-identical.
 
 You cannot review that property in a binary, and you cannot unit-test it
 without a parser. That is the argument for the boundary.
@@ -253,7 +290,7 @@ compiler/             out-of-tree MLIR: the `kea` dialect, conversions,
   include/kea/        fuse/tile/schedule/alloc passes, the .kasm emitter
   lib/                    Dialect/ Conversion/ Transforms/ Target/Kasm
   tools/              kea-opt, kea-translate
-  test/               lit tests (32)
+  test/               lit tests (34)
 sim/                  the cycle-approximate simulator (functional + timing)
 runtime/              KEAF reader/writer, the .kasm assembler, kea-rt
 tools/                kea-as, kea-dis, kea-sim, keac  (+ keac's e2e tests)
@@ -262,7 +299,8 @@ frontend/             PTQ: torch/ONNX -> .kgraph.json, the numpy golden model,
 models/               the shipped quantized graphs (MobileNetV2, a tiny ViT)
 tests/mlir/           verified TOSA and linalg examples for 20.1.6
 tests/invariants/     cross-component invariants (e.g. requant equivalence)
-demo/                 the end-to-end demo, its results, and bug reproducers
+demo/                 the end-to-end demo, its results, and regress/ --
+                        regression tests for the defects found in bring-up
 docs/                 the specifications; adr/ for the three decisions
 ```
 

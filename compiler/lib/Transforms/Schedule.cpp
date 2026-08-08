@@ -232,16 +232,20 @@ struct BufferInfo {
 //===----------------------------------------------------------------------===//
 
 struct Sched {
-  Sched(func::FuncOp f, StringRef mode, int64_t depth, bool annotate)
-      : func(f), serial(mode == "serial"), annotateUnits(annotate) {
+  Sched(func::FuncOp f, StringRef m, int64_t depth, int64_t margin,
+        bool annotate)
+      : func(f), mode(m), serial(m == "serial"), annotateUnits(annotate) {
     queueDepth = depth > 0 ? depth : (int64_t)::kea::KEA_QUEUE_DEPTH;
+    fragMargin = std::min<int64_t>(std::max<int64_t>(margin, 0), 50);
   }
 
   func::FuncOp func;
   Block *block = nullptr;
+  std::string mode = "auto";
   bool serial = false;
   bool annotateUnits = true;
   int64_t queueDepth = ::kea::KEA_QUEUE_DEPTH;
+  int64_t fragMargin = 6;
 
   SmallVector<Node> nodes;
   SmallVector<Region> regions;
@@ -261,24 +265,35 @@ struct Sched {
 
   // assignSync()'s output.
   SmallVector<SmallVector<std::pair<int, int>, 2>> waitsBefore;
-  SmallVector<SmallVector<int, 2>> signalsAfter;
+  /// `signalsAfter[q][C]` is the increment the SIGNAL placed after stream
+  /// position `q` on channel (queue(q), C) carries. A count rather than a flag
+  /// because the LOAD_W/MATMUL fix-up below can move one producer's signal onto
+  /// another's position, and two tokens on one channel must stay two tokens.
+  SmallVector<std::array<int, QCOUNT>> signalsAfter;
   SmallVector<std::array<int, QCOUNT>> hbFront;
   std::array<std::array<int, QCOUNT>, QCOUNT> eventId = {};
   int numEvents = 0;
 
   int64_t nSignals = 0, nWaits = 0, nHoisted = 0;
 
-  std::array<int, 3> window = {}; ///< buffers of a space that may be live
+  std::array<int, 3> window = {};      ///< buffers of a space that may be live
+  std::array<int, 3> windowStart = {}; ///< what the extents alone allow
+  std::array<SmallVector<int>, 3> perSpace; ///< buffer ids, original order
+  SmallVector<Node> baseGraph;         ///< the graph before rotation edges
+  StringRef chosenPlan = "overlap";
+  bool planFits = false; ///< computePlan(): are the widened ranges placeable?
+  int64_t modelledOverlap = -1, modelledInOrder = -1;
   int capacityIters = 0;
 
   LogicalResult run(bool reportSchedule);
 
   void resetSchedule();
+  int64_t computePlan(bool inOrder);
   std::array<int64_t, 3> spmPeak() const;
   void collect();
   void buildDeps();
   void protectWeightPairs();
-  void listSchedule();
+  void listSchedule(bool inOrder);
   void serialSchedule();
   void assignSync();
   void locateRegions();
@@ -523,7 +538,7 @@ void Sched::protectWeightPairs() {
 //     do not fit in the half scratchpad `-kea-tile` reserved. A candidate that
 //     would push a space past its capacity loses to any candidate that fits.
 
-void Sched::listSchedule() {
+void Sched::listSchedule(bool inOrder) {
   const int n = (int)nodes.size();
   order.clear();
   order.reserve(n);
@@ -566,6 +581,7 @@ void Sched::listSchedule() {
   while (!ready.empty()) {
     int best = -1, bestQueue = -1;
     int64_t bestKey = 0, bestStart = 0, bestOcc = 0, bestStall = 0;
+    int64_t bestHeight = 0;
     bool bestFits = false;
 
     for (int cand : ready) {
@@ -593,7 +609,12 @@ void Sched::listSchedule() {
         qs.push_back(nd.queue);
       else {
         qs.push_back(QDMA0);
-        qs.push_back(QDMA1);
+        // The in-order plan is a faithful model of what the backend emits
+        // without this pass: -kea-tile's order, one engine, minimal sync.
+        // Modelling it with the *same* cost model is what makes `mode=auto`'s
+        // comparison meaningful.
+        if (!inOrder)
+          qs.push_back(QDMA1);
       }
 
       // ENGINE SELECTION. Two DMA engines exist so a prefetch can run while a
@@ -629,8 +650,15 @@ void Sched::listSchedule() {
           take = start < chosenStart;
         else if (!take && occ != chosenOcc)
           take = occ < chosenOcc;
-        else if (!take && start == chosenStart && occ == chosenOcc)
-          take = busy[q] < busy[chosenQ];
+        // No load balancing on a tie. If both engines can start this
+        // descriptor in the same cycle, moving it to the idle one buys
+        // nothing -- it finishes no earlier -- and costs real cycles, because
+        // the two engines share one 16 B/cycle DRAM port and a concurrent
+        // transfer runs at 8. DMA1 is therefore SPILLOVER: it is used exactly
+        // when DMA0 is still busy and DMA1 would start sooner, which is the
+        // only situation in which a second engine buys anything. Measured on a
+        // 28-convolution MobileNetV2 prefix that is DRAM-bandwidth bound:
+        // balancing for its own sake cost 1,845,443 -> 2,246,180 cycles.
         if (take) {
           chosenQ = q;
           chosenStart = start;
@@ -639,16 +667,39 @@ void Sched::listSchedule() {
         }
       }
 
-      // Earliest start wins; the critical path breaks ties, scaled down so it
-      // never outweighs a real cycle of delay by much.
-      const int64_t key = chosenStart + chosenStall - nd.height / 64;
+      // EARLIEST START WINS, AND ONLY THEN THE CRITICAL PATH. The comparison
+      // is strictly lexicographic -- (fits, start + stall, -height, index) --
+      // and that matters more than it looks.
+      //
+      // This was once `start + stall - height/64`, a weighted sum, on the
+      // theory that the critical path is a mild tie-break. It is not
+      // scale-invariant. `height` is the longest remaining dependence path in
+      // *cycles*, and because every MXU instruction is chained to the next
+      // (§2.3), the first MXU instruction of a 28-layer network has a height
+      // of about a million -- so `height/64` was ~15,000, far larger than any
+      // difference in `start` among the candidates. The scheduler therefore
+      // drained the whole MXU chain first: measured on a 28-convolution
+      // MobileNetV2 prefix, every layer's MXU work landed in the first 1,200
+      // of 11,600 instructions, the depth-16 MXU queue stayed full, and the
+      // in-order dispatcher stalled for 98.8% of the run. That was a 5%
+      // *regression* against not scheduling at all.
+      //
+      // Lexicographic ordering restores the intent: a candidate that can start
+      // a cycle earlier always wins, the queue-depth stall priced into `stall`
+      // is never swamped, and `height` only decides between candidates that
+      // are otherwise identical.
+      const int64_t key = chosenStart + chosenStall;
       bool better;
       if (best < 0)
         better = true;
+      else if (inOrder)
+        better = cand < best;
       else if (fits != bestFits)
         better = fits;
       else if (key != bestKey)
         better = key < bestKey;
+      else if (nd.height != bestHeight)
+        better = nd.height > bestHeight;
       else
         better = cand < best;
       if (better) {
@@ -658,6 +709,7 @@ void Sched::listSchedule() {
         bestStart = chosenStart;
         bestOcc = chosenOcc;
         bestStall = chosenStall;
+        bestHeight = nd.height;
         bestFits = fits;
       }
     }
@@ -778,7 +830,7 @@ void Sched::serialSchedule() {
 void Sched::assignSync() {
   const int n = (int)order.size();
   waitsBefore.assign(n, {});
-  signalsAfter.assign(n, {});
+  signalsAfter.assign(n, std::array<int, QCOUNT>{});
   hbFront.assign(n, {});
 
   SmallVector<std::array<int, QCOUNT>> need(n);
@@ -806,8 +858,7 @@ void Sched::assignSync() {
         continue;
       const int q = need[p][u];
       waitsBefore[p].push_back({q, u});
-      if (!llvm::is_contained(signalsAfter[q], C))
-        signalsAfter[q].push_back(C);
+      signalsAfter[q][C]++;
       // Waiting for q orders C after everything q was ordered after, too.
       for (int w = 0; w < QCOUNT; ++w)
         front[C][w] = std::max(front[C][w], hbFront[q][w]);
@@ -830,10 +881,10 @@ void Sched::assignSync() {
     for (auto &w : waitsBefore[p])
       waitsBefore[p - 1].push_back(w);
     waitsBefore[p].clear();
-    for (int c : signalsAfter[p - 1])
-      if (!llvm::is_contained(signalsAfter[p], c))
-        signalsAfter[p].push_back(c);
-    signalsAfter[p - 1].clear();
+    for (int c = 0; c < QCOUNT; ++c) {
+      signalsAfter[p][c] += signalsAfter[p - 1][c];
+      signalsAfter[p - 1][c] = 0;
+    }
   }
 
   for (auto &a : eventId)
@@ -922,10 +973,12 @@ void Sched::materialize() {
       // assignment is readable and testable. -kea-emit must not need it.
       nd.op->setAttr("kea.unit", unitAttr(nd.queue));
     stream.push_back(nd.op);
-    for (int c : signalsAfter[p]) {
-      auto sig = b.create<SignalOp>(nd.op->getLoc(),
-                                    b.getI64IntegerAttr(eventId[nd.queue][c]),
-                                    b.getI64IntegerAttr(1), unitAttr(nd.queue));
+    for (int c = 0; c < QCOUNT; ++c) {
+      if (signalsAfter[p][c] == 0)
+        continue;
+      auto sig = b.create<SignalOp>(
+          nd.op->getLoc(), b.getI64IntegerAttr(eventId[nd.queue][c]),
+          b.getI64IntegerAttr(signalsAfter[p][c]), unitAttr(nd.queue));
       stream.push_back(sig);
       ++nSignals;
     }
@@ -1081,14 +1134,17 @@ void Sched::report() {
     queues.push_back(b.getNamedAttr(queueName(q), b.getDictionaryAttr(e)));
   }
   SmallVector<NamedAttribute> top{
-      b.getNamedAttr("mode", b.getStringAttr(serial ? "serial" : "overlap")),
+      b.getNamedAttr("mode", b.getStringAttr(serial ? "serial" : chosenPlan)),
       b.getNamedAttr("modelled_cycles", b.getI64IntegerAttr(modelledCycles)),
       b.getNamedAttr("dispatch_stall", b.getI64IntegerAttr(dispatchStall)),
       b.getNamedAttr("queue_depth", b.getI64IntegerAttr(queueDepth)),
+      b.getNamedAttr("fragmentation_margin", b.getI64IntegerAttr(fragMargin)),
       b.getNamedAttr("events", b.getI64IntegerAttr(numEvents)),
       b.getNamedAttr("signals", b.getI64IntegerAttr(nSignals)),
       b.getNamedAttr("waits", b.getI64IntegerAttr(nWaits)),
       b.getNamedAttr("hoisted", b.getI64IntegerAttr(nHoisted)),
+      b.getNamedAttr("modelled_overlap", b.getI64IntegerAttr(modelledOverlap)),
+      b.getNamedAttr("modelled_in_order", b.getI64IntegerAttr(modelledInOrder)),
       b.getNamedAttr("capacity_iters", b.getI64IntegerAttr(capacityIters + 1)),
       b.getNamedAttr("buffers_in_flight",
                      b.getI64ArrayAttr({window[0], window[1], window[2]})),
@@ -1154,6 +1210,109 @@ std::array<int64_t, 3> Sched::spmPeak() const {
   return peak;
 }
 
+/// Run the capacity fixpoint for one strategy and leave every field of the
+/// plan (`order`, the waits and signals, the alloc hoists, the model's
+/// counters) set for it. `inOrder` selects the model of what the backend emits
+/// WITHOUT this pass -- -kea-tile's order, one engine, minimal sync -- which is
+/// what `mode=auto` compares against. Returns the modelled cycle count.
+int64_t Sched::computePlan(bool inOrder) {
+  std::array<bool, 3> strict = {};
+  for (int s = 0; s < 3; ++s)
+    window[s] = windowStart[s];
+  bool fits = false;
+  for (capacityIters = 0;; ++capacityIters) {
+    nodes = baseGraph;
+    for (int s = 0; s < 3; ++s) {
+      const SmallVector<int> &v = perSpace[s];
+      for (int i = window[s]; i < (int)v.size(); ++i) {
+        const BufferInfo &prev = buffers[v[i - window[s]]];
+        const BufferInfo &cur = buffers[v[i]];
+        const int to = *std::min_element(cur.users.begin(), cur.users.end());
+        // At K > 1 one edge from the previous generation's LAST user is
+        // enough: K buffers are meant to be live together, so the bound is
+        // about *how many*, not about a clean handoff.
+        //
+        // At K = 1 that is not enough, and the difference is the whole reason
+        // this loop needs a floor. One edge orders the two buffers along one
+        // queue only, and §6's `lo()` walks back along every *other* queue
+        // until it finds something unordered -- so with one edge per pair the
+        // widened ranges cascade: measured on a 28-convolution prefix at
+        // `spm-reserve-factor=1`, twenty 112 KB activation tiles came out
+        // mutually overlapping, a 2.2 MB peak against a 256 KB scratchpad.
+        // K = 1 means "these buffers may never be live together", so express
+        // exactly that: order the next generation's first use after *every*
+        // user of the previous one, which is a handoff on every queue that
+        // touched it.
+        SmallVector<int, 4> froms;
+        if (strict[s])
+          froms.assign(prev.users.begin(), prev.users.end());
+        else
+          froms.push_back(
+              *std::max_element(prev.users.begin(), prev.users.end()));
+        for (int from : froms) {
+          if (from >= to || llvm::is_contained(nodes[from].succs, to))
+            continue;
+          nodes[from].succs.push_back(to);
+          nodes[to].preds.push_back(from);
+        }
+      }
+    }
+    // The rotation edges are new graph edges, so the LOAD_W/MATMUL protection
+    // has to be re-established over them -- and this is where it matters most.
+    // The last user of an SPM_W weight tile is a `kea.load_w`, so a rotation
+    // edge makes the DMA that refills a *later* weight tile a direct consumer
+    // of a LOAD_W. Without this call that consumer waits on the LOAD_W rather
+    // than on its paired MATMUL, and the fix-up in assignSync() then has to
+    // move a signal onto a position that already owes one. See §5.3 of
+    // docs/SCHEDULING.md.
+    protectWeightPairs();
+    resetSchedule();
+    if (serial)
+      serialSchedule();
+    else
+      listSchedule(inOrder);
+    assignSync();
+    hoistAllocs();
+    const std::array<int64_t, 3> peak = spmPeak();
+    fits = true;
+    bool reduced = false;
+    for (int s = 0; s < 3; ++s) {
+      const int64_t cap = spaceCapacity((AddressSpace)s);
+      if (peak[s] > cap)
+        fits = false;
+      // Tighten past the hard limit, to 15/16 of it. `peak` is -kea-alloc's
+      // `maxlive`, a lower bound no allocator can beat -- but that pass packs
+      // greedily by first fit, so a plan whose maxlive fills 90% of a
+      // scratchpad can still be refused for fragmentation. Measured: a
+      // 46-layer prefix at `spm-reserve-factor=2` reached an SPM_W maxlive of
+      // 235,220 of 262,144 and -kea-alloc could not place an 11,520-byte
+      // qparam tile in what was left. A 6% margin turns that class of hard
+      // failure into a slightly slower program. `fits` above is still keyed to
+      // the real capacity, so the margin never *causes* a failure; it only
+      // makes the loop stop giving overlap back one step earlier.
+      if (peak[s] > cap - cap * fragMargin / 100) {
+        if (window[s] > 1) {
+          window[s]--;
+          reduced = true;
+        } else if (!strict[s]) {
+          strict[s] = true;
+          reduced = true;
+        }
+      }
+    }
+    // Stop when nothing was tightened this round: either the plan is inside
+    // the margin, or there is no room left to give back. In the second case
+    // either -kea-tile's own tiles do not fit -- its diagnostic to give, and
+    // -kea-alloc's to repeat -- or this strategy is too aggressive for this
+    // program, and run() decides which by trying a less aggressive one.
+    if (serial || !reduced)
+      break;
+  }
+  planFits = fits;
+
+  return modelledCycles;
+}
+
 LogicalResult Sched::run(bool reportSchedule) {
   block = &func.getBody().front();
   collect();
@@ -1161,8 +1320,9 @@ LogicalResult Sched::run(bool reportSchedule) {
     return success();
 
   buildDeps();
+  baseGraph = nodes;
 
-  // THE CAPACITY FIXPOINT -- how many tile buffers may be in flight.
+  // THE CAPACITY BOUND -- how many tile buffers of a space may be in flight.
   //
   // -kea-tile gives every tile a fresh `kea.alloc`, so nothing in the IR says
   // "there are only two activation buffers and they rotate". Left alone, the
@@ -1176,21 +1336,16 @@ LogicalResult Sched::run(bool reportSchedule) {
   // In each address space, buffer *i*'s first use is ordered after buffer
   // *i-K*'s last use -- an ordinary dependence, which §4 turns into an ordinary
   // WAIT, and which is precisely the "buffer 0 free" handshake of the
-  // hand-written double-buffered layer. `K` is how many of that space's buffers
-  // fit at once, computed from the real extents; if the *extended* ranges still
-  // do not fit, K comes down and the schedule is recomputed. K = 1 is the floor
-  // and always fits: no two buffers of a space are ever live together.
-  const SmallVector<Node> baseGraph = nodes;
-
-  std::array<SmallVector<int>, 3> perSpace; ///< buffer indices, original order
+  // hand-written double-buffered layer. `K` starts at how many of that space's
+  // buffers fit at once, computed from the real extents; computePlan() walks it
+  // down, and then to a full handoff, until what -kea-alloc is handed fits.
   for (auto [i, b] : llvm::enumerate(buffers))
     if (!b.users.empty())
       perSpace[(int)b.space].push_back((int)i);
-
   for (int s = 0; s < 3; ++s) {
     const int64_t cap = spaceCapacity((AddressSpace)s);
     const SmallVector<int> &v = perSpace[s];
-    window[s] = 1;
+    windowStart[s] = 1;
     for (int k = 2; k <= (int)v.size(); ++k) {
       int64_t worst = 0;
       for (int i = 0; i + k <= (int)v.size(); ++i) {
@@ -1201,48 +1356,54 @@ LogicalResult Sched::run(bool reportSchedule) {
       }
       if (worst > cap)
         break;
-      window[s] = k;
+      windowStart[s] = k;
     }
   }
 
-  bool fits = false;
-  for (capacityIters = 0;; ++capacityIters) {
-    nodes = baseGraph;
-    for (int s = 0; s < 3; ++s) {
-      const SmallVector<int> &v = perSpace[s];
-      for (int i = window[s]; i < (int)v.size(); ++i) {
-        const BufferInfo &prev = buffers[v[i - window[s]]];
-        const BufferInfo &cur = buffers[v[i]];
-        const int from = *std::max_element(prev.users.begin(), prev.users.end());
-        const int to = *std::min_element(cur.users.begin(), cur.users.end());
-        if (from >= to || llvm::is_contained(nodes[from].succs, to))
-          continue;
-        nodes[from].succs.push_back(to);
-        nodes[to].preds.push_back(from);
+  // MODE. `overlap` always reorders; `serial` never does and is the A/B
+  // control docs/SCHEDULING.md measures against. `auto`, the default, costs
+  // both with the same model and keeps the better one -- which is what makes
+  // `--schedule` safe to leave on. Reordering is not free: the soundness
+  // obligation in §6 is discharged with real dependence edges, and on a
+  // program that has no room to double buffer (`spm-reserve-factor=1` leaves
+  // none by construction, DIALECT_L2.md §8) those edges are pure cost. The
+  // model is accurate enough to tell the difference -- measured within 0.1% of
+  // `kea-sim` on a 28-convolution MobileNetV2 prefix -- so the pass can simply
+  // decline instead of regressing.
+  if (serial) {
+    computePlan(/*inOrder=*/false);
+  } else {
+    // Cost the overlapped plan and, unless the caller insisted on it, the
+    // in-order one, and keep the cheaper of the plans that FIT. A plan that
+    // does not fit is one whose widened ranges -kea-alloc provably cannot
+    // place; emitting it would turn this pass's aggressiveness into that
+    // pass's failure. `serial` is the floor and always fits, because nothing
+    // in it is concurrent and every range is the one -kea-tile sized.
+    modelledOverlap = computePlan(/*inOrder=*/false);
+    const bool overlapFits = planFits;
+    bool useOverlap = overlapFits;
+    if (mode == "auto" || !overlapFits) {
+      modelledInOrder = computePlan(/*inOrder=*/true);
+      const bool inOrderFits = planFits;
+      if (!inOrderFits)
+        useOverlap = overlapFits;
+      else if (!overlapFits)
+        useOverlap = false;
+      else
+        useOverlap = modelledOverlap < modelledInOrder;
+      if (!overlapFits && !inOrderFits) {
+        serial = true;
+        computePlan(/*inOrder=*/false);
+        chosenPlan = "serial";
+      } else if (useOverlap) {
+        computePlan(/*inOrder=*/false);
+        chosenPlan = "overlap";
+      } else {
+        chosenPlan = "in-order";
       }
+    } else {
+      chosenPlan = "overlap";
     }
-    resetSchedule();
-    if (serial)
-      serialSchedule();
-    else
-      listSchedule();
-    assignSync();
-    hoistAllocs();
-    const std::array<int64_t, 3> peak = spmPeak();
-    fits = true;
-    bool reduced = false;
-    for (int s = 0; s < 3; ++s)
-      if (peak[s] > spaceCapacity((AddressSpace)s)) {
-        fits = false;
-        if (window[s] > 1) {
-          window[s]--;
-          reduced = true;
-        }
-      }
-    // Out of room to give back: -kea-tile's own tiles do not fit, which is its
-    // diagnostic to give (and -kea-alloc's to repeat), not this pass's.
-    if (fits || serial || !reduced)
-      break;
   }
 
   if (numEvents > ::kea::KEA_NUM_EVENTS)
@@ -1274,8 +1435,8 @@ struct KeaSchedulePass
     if (func.isExternal() || func.getBody().empty())
       return;
 
-    if (mode != "overlap" && mode != "serial") {
-      func.emitOpError("-kea-schedule=mode= must be \"overlap\" or "
+    if (mode != "auto" && mode != "overlap" && mode != "serial") {
+      func.emitOpError("-kea-schedule=mode= must be \"auto\", \"overlap\" or "
                        "\"serial\", got \"")
           << mode << "\"";
       return signalPassFailure();
@@ -1298,7 +1459,7 @@ struct KeaSchedulePass
       return;
     }
 
-    Sched s(func, mode, queueDepth, annotateUnits);
+    Sched s(func, mode, queueDepth, fragmentationMargin, annotateUnits);
     if (failed(s.run(reportSchedule)))
       return signalPassFailure();
     numSignals += s.nSignals;

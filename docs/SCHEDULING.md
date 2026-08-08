@@ -48,11 +48,17 @@ no overlap                   loads hoisted, stores sunk
    run concurrently with one of its users. That is the whole of ADR-0002's
    soundness obligation, discharged.
 6. Re-stamp the live ranges, re-run `verifyWeightBanks()`, re-prove Rule D.
+7. And, in `mode=auto`, do 2–6 a second time for a plan that does *not* reorder,
+   and emit whichever of the two the model says is cheaper (§9). Reordering has
+   a cost, and on a program with no room to double buffer it is the only thing
+   left.
 
 ```bash
-kea-opt in.mlir -kea-schedule
+kea-opt in.mlir -kea-schedule                        # mode=auto: §9
 kea-opt in.mlir -kea-schedule=report-schedule=true   # publish kea.schedule
-kea-opt in.mlir -kea-schedule=mode=serial            # the A/B baseline, §8
+kea-opt in.mlir -kea-schedule=mode=overlap           # always reorder
+kea-opt in.mlir -kea-schedule=mode=serial            # never -- the A/B baseline
+kea-opt in.mlir -kea-schedule=fragmentation-margin=0 # spend the whole SPM, §6.3
 kea-opt in.mlir "-kea-schedule=queue-depth=2 report-schedule=true"
 kea-opt in.mlir -kea-schedule=annotate-units=false   # drop the kea.unit stamps
 ```
@@ -80,27 +86,44 @@ so the assignment is readable and FileCheck-testable. That attribute is
 advisory; `-kea-emit` must not need it, and `annotate-units=false` turns it
 off.
 
-### 2.2 Which DMA engine
+### 2.2 Which DMA engine — spillover, not load balancing
 
 Two engines share one 16 B/cycle DRAM port (MICROARCH.md §6.1), so a second
 engine buys **no bandwidth**: two concurrent transfers get 8 B/cycle each. It
 buys *concurrency* — a prefetch and a write-back in flight at the same time,
 which is the entire reason ISA.md §12's hand-written layer alternates them.
-That only happens if the work is actually spread.
 
-Each descriptor is priced on both engines and takes the one that:
+Each descriptor is priced on both engines and takes the one that
 
-1. can **start** it soonest (the engine's queue is in-order, so this is the
-   later of "engine free" and "dependences visible");
-2. then, the one with the shorter **contended occupancy** — `keaDmaOccupancy()`
-   plus the cycles the other engine's data phase overlaps this one's, which is
-   the 16 → 8 B/cycle stretch;
-3. then, the **less loaded** engine.
+1. can **start** it soonest (each engine's queue is in-order, so this is the
+   later of "engine free" and "dependences visible"); then
+2. has the shorter **contended occupancy** — `keaDmaOccupancy()` plus the cycles
+   the other engine's data phase overlaps this one's, the 16 → 8 B/cycle stretch.
 
-Rule 3 is not cosmetic. Without it every descriptor whose dependences are
-already satisfied ties on rules 1 and 2 and piles onto DMA0, and the second
-engine becomes decoration: on the MobileNetV2 block that was 10 descriptors /
-1390 cycles on DMA0 against 4 / 240 on DMA1. With it, 8 / 894 against 6 / 734.
+**And nothing else. There is deliberately no load-balancing tie-break.** If both
+engines can start a descriptor in the same cycle, moving it to the idle one buys
+nothing — it finishes no earlier — and costs real cycles as soon as anything
+else wants the port. DMA1 is *spillover*: it gets a descriptor exactly when DMA0
+is still busy and DMA1 would start sooner, which is the only situation in which
+a second engine is worth anything.
+
+This was originally a balancing rule ("on a tie, the less loaded engine"), added
+because DMA0 otherwise took 10 of 14 descriptors on a small block. It is the
+single worst thing the pass ever did. On a 28-convolution MobileNetV2 prefix,
+which is DRAM-bandwidth bound (12.1 MB of traffic, DMA busy 948k cycles against
+MXU 609k), balancing split a stream that had nothing to overlap with, doubled
+every transfer's data-phase latency, and lengthened the `DMA → MXU → VPU → DMA`
+critical chain:
+
+| 28-convolution prefix, `--spm-reserve 1` | cycles |
+|---|---:|
+| not scheduled | 2,130,318 |
+| scheduled, balancing across both engines | 2,246,180 |
+| scheduled, everything on one engine | **1,845,443** |
+
+Spillover recovers all of that and costs nothing where a second engine does
+help: `@conv_tile_loop` went from 1.301× to 1.511× on the same change, and
+`@pointwise_64_to_16` was unaffected at 1.756×.
 
 ### 2.3 The one queue whose order is frozen
 
@@ -259,7 +282,36 @@ both directions are checked in the code comments to preserve the property.
 `checkRuleD()` walks the finished block and simulates the counters anyway,
 because the assembler rejects a violating program and `kea-sim` reports one, and
 a compiler that can only find out at that distance from the mistake is not much
-use. It has never fired. `kea-as` and `kea-sim` are the independent check: every
+use.
+
+**It has fired, once, and the argument above was wrong in exactly one place.**
+Every lowerable prefix of MobileNetV2 at or beyond node 99 failed it, while the
+same prefix without `--schedule` compiled cleanly, and the threshold moved with
+`spm-reserve-factor` (`demo/repro/run_repro.sh` defect 3). Program length, not
+any particular layer. The mechanism, in three steps:
+
+1. §6.2's rotation edges are added *inside* the capacity fixpoint, after the
+   dependence graph was built — and **the last user of an SPM_W weight tile is a
+   `kea.load_w`**. So a rotation edge makes the DMA that refills a later weight
+   tile a direct consumer of a LOAD_W.
+2. `protectWeightPairs()`, which redirects exactly such consumers onto the
+   paired `kea.mm` so that no SIGNAL is ever slipped between a LOAD_W and its
+   MATMUL, had already run and never saw those edges. So `need` pointed at the
+   LOAD_W.
+3. §2.3's fix-up then moved that SIGNAL down onto the MATMUL — where another
+   SIGNAL on the same `(MXU, DMAx)` channel already sat — and the two collapsed
+   into one flag. Two waits, one token. Fact 2 above ("the *i*-th signal and the
+   *i*-th wait correspond to the same producer") had quietly become false,
+   because a *position* could owe two tokens and only one was emitted.
+
+Both halves are now closed. `protectWeightPairs()` runs again after the rotation
+edges, so no cross-queue consumer ever depends on a LOAD_W directly; and a
+SIGNAL carries a **count** rather than a flag, so even if two producers' tokens
+did land on one position they would stay two tokens. Either fix alone is
+sufficient; both are cheap. `compiler/test/kea-schedule-ruled.mlir` is the
+regression test — three weight tiles that cannot all be resident, which is the
+smallest program that forces a rotation edge out of a `kea.load_w` — and it
+fails if either half is reverted. `kea-as` and `kea-sim` are the independent check: every
 measurement in §8 went through both, and `kea-sim --strict-hazards
 --strict-poison` — which makes an unsynchronized cross-unit read fatal — passes
 on the scheduled MobileNetV2 block.
@@ -359,11 +411,48 @@ real extents; if the extended ranges still do not fit, *K* comes down and the
 schedule is recomputed. *K* = 1 is the floor and always fits, because then no two
 buffers of a space are ever live together.
 
+At *K* > 1 one edge, from the previous generation's last user, is enough: *K*
+buffers are *meant* to be live together, so the bound is about how many. **At
+*K* = 1 one edge is not enough**, and the difference is why this loop needs a
+floor. One edge orders the two buffers along one queue only, and §6.1's `lo()`
+walks back along every *other* queue until it finds something unordered, so the
+widened ranges cascade: measured on a 28-convolution prefix at
+`spm-reserve-factor=1`, twenty 112 KB activation tiles came out mutually
+overlapping — a 2.2 MB peak against a 256 KB scratchpad, which `-kea-alloc`
+correctly refused. *K* = 1 means "these buffers may never be live together", so
+the floor says exactly that: order the next generation's first use after *every*
+user of the previous one, a handoff on every queue that touched it.
+
 The fixpoint converges in one iteration on the MobileNetV2 block (*K* = 7 for
 SPM_A) and in three on `@pointwise_64_to_16` (6 → 4), which
 `compiler/test/kea-schedule-tileloop.mlir` pins. `report-schedule=true`
 publishes `buffers_in_flight`, `capacity_iters` and the resulting per-space
 peaks.
+
+### 6.3 The anti-fragmentation margin
+
+`spmPeak()` is `-kea-alloc`'s `maxlive`: a lower bound no allocator can beat.
+It is not a guarantee, because that pass packs greedily by first fit
+(MEMORY_PLANNING.md §3.1), and a plan whose maxlive fills 90% of a scratchpad
+can still be refused for fragmentation. Measured: a 46-layer prefix at
+`spm-reserve-factor=2` reached an SPM_W maxlive of 235,220 of 262,144 bytes and
+`-kea-alloc` could not place an 11,520-byte qparam tile in what was left.
+
+So the fixpoint keeps giving overlap back until every space is inside
+`fragmentation-margin` percent of its capacity (default 6). The `fits` test is
+still keyed to the real capacity, so the margin never *causes* a failure — it
+only stops the loop one step earlier. It costs about 9% of the speedup on
+programs that would have fitted anyway, which is the price of not turning a
+compiling program into a hard allocator failure:
+
+| | `fragmentation-margin=6` (default) | `=0` |
+|---|---:|---:|
+| `@pointwise_64_to_16` | 1.605× | **1.756×** |
+| `@conv_tile_loop` | 1.388× | **1.511×** |
+| 28-convolution prefix, reserve 2 | 1.484× | **1.603×** |
+| 46-layer prefix, reserve 2 | compiles | **`-kea-alloc` fails** |
+
+Set it to 0 if you know your program fits.
 
 ---
 
@@ -375,15 +464,21 @@ any `kea.mm`, else DWU, else VPU — because errata E4 says a `REGION_END` keeps
 accumulating until the *issuing* unit's pipeline drains, and that is only the
 honest attribution if the issuing unit is the one doing the work.
 
-The markers bracket every instruction of the region on whichever queue it ended
-up, because a region's counters cover every unit's activity in its cycle window
-(SIMULATOR.md §5) — a layer must own the DMA that feeds it. The consequence
-worth stating: **software pipelining makes consecutive regions overlap**, so a
-prefetch issued for layer *n+1* during layer *n*'s window is attributed to layer
-*n*. Errata E4 already anticipates this ("the tail of layer *n* really is
-executing while layer *n+1* starts"); with cross-layer prefetch the overlap is
-larger than a pipeline depth. It is an accounting artifact of the optimization,
-not a modelling error, but a per-layer roofline should be read with it in mind.
+The markers bracket the region's instructions **on that queue**, not across all
+of them. Bracketing across every queue sounds more faithful — SIMULATOR.md §5
+does say a region's counters cover every unit's activity in its window, so a
+layer should own the DMA that feeds it — but it does not survive software
+pipelining. A weight prefetch hoisted twenty layers early opens that layer's
+region twenty layers early, and on a 28-convolution program every region then
+spans almost the whole run: measured, 29 regions summing to **41.9M cycles
+inside a 2.24M-cycle program**. That is not attribution, it is noise, and it
+made the per-layer numbers in a scheduled build meaningless.
+
+Bracketing on the region's own queue keeps each window to roughly its own layer.
+Work hoisted out of a layer is then attributed to whatever was executing when it
+actually ran, which is the standard convention for pipelined code and the one
+errata E4 already describes for a single pipeline depth. Consecutive regions can
+still overlap by more than that; read a per-layer roofline with it in mind.
 
 ---
 
@@ -419,43 +514,77 @@ python3 compiler/test/kea-schedule-measure.py \
 
 | program | shape | unscheduled | scheduled | **speedup** |
 |---|---|---:|---:|---:|
-| `@pointwise_64_to_16` | 1×1 conv 64→16, 64², 4 spatial tiles, DMA/compute balanced | 58,066 | **33,071** | **1.756×** |
-| `@conv_tile_loop` | 3×3 conv 16→32, 64², 4 tile iterations, MXU bound | 120,642 | **92,750** | **1.301×** |
-| `@mobilenet_v2_inverted_residual` | the integration test: 3 dependent layers, 1 tile each | 2,750 | **2,132** | **1.290×** |
+| `@pointwise_64_to_16` | 1×1 conv 64→16, 64², 4 spatial tiles, DMA/compute balanced | 58,070 | **36,190** | **1.605×** |
+| `@conv_tile_loop` | 3×3 conv 16→32, 64², 4 tile iterations, MXU bound | 122,002 | **87,896** | **1.388×** |
+| `@mobilenet_v2_inverted_residual` | the integration test: 3 dependent layers, 1 tile each | 2,755 | **2,135** | **1.290×** |
 
-All cycle counts are `kea-sim`'s `total_cycles`. `sim/tests/test_timing.cpp`
-gets 1.709× on a hand-written double-buffered program; the pass gets 1.756× on
-the layer whose balance matches that test.
+All cycle counts are `kea-sim`'s `total_cycles`, at the default
+`fragmentation-margin=6`; §6.3 has the `=0` column, where the first two are
+1.756× and 1.511×. `sim/tests/test_timing.cpp` gets 1.709× on a hand-written
+double-buffered program.
+
+### 8.1.1 Multi-layer, and the one number that matters most
+
+The single-layer numbers above are each their own program: every one pays a cold
+start and none overlaps a neighbour. The multi-layer measurement is the honest
+one, and it says something the per-layer numbers do not.
+
+| MobileNetV2 nodes 0..97, 28 convolutions | unscheduled | scheduled | speedup |
+|---|---:|---:|---:|
+| `--spm-reserve 1` | 2,130,318 | 2,126,037 | 1.002× |
+| `--spm-reserve 2` | 2,201,600 | **1,483,744** | **1.484×** |
+| `--spm-reserve 3` | 2,264,164 | **1,381,050** | **1.639×** |
+| whole feature extractor (0..178, 52 convolutions), reserve 1 | 3,231,748 | 3,226,230 | 1.002× |
+
+**Best unscheduled build, any reserve factor: 2,130,318. Best scheduled build:
+1,381,050. That is 1.543× on the real program**, and it is the number to quote.
+
+**`--spm-reserve 1` is the configuration in which the scheduler cannot win, and
+that is not a defect in the scheduler.** DIALECT_L2.md §8 says so outright: a
+reserve factor of 1 "produces the largest tiles and a program that cannot be
+double buffered". Concretely, at reserve 1 `-kea-tile` sizes one tile set to
+fill the whole scratchpad, two consecutive SPM_A buffers do not fit together,
+§6.2's buffers-in-flight bound is 1 for SPM_A and for ACC before the fixpoint
+even starts, and the strict handoff it then needs is *more* ordering than the
+unscheduled program has. There is nothing left to overlap and the soundness
+obligation is pure cost. An earlier build measured that directly: 2,130,318 →
+2,264,218, a 6% regression.
+
+So the pass does not do it. `mode=auto` (§9) costs the reordered plan and the
+in-order plan with the same model and emits the cheaper one; at reserve 1 it
+emits the in-order plan, which is why the two rows above read 1.002× instead of
+0.94×. The 0.2% it does gain is its minimal-sync analysis being slightly tighter
+than the emitter's.
+
+The demo is pinned to `--spm-reserve 1` only because the whole feature extractor
+overruns IMEM at reserve 2 (`demo/repro/run_repro.sh` defect 4, a `-kea-tile`
+instruction-count problem). **Fixing that unlocks the 1.5× on the whole
+network**; it is the single highest-value item left in the backend.
 
 ### 8.2 Per-unit breakdown — `@pointwise_64_to_16`
 
 The layer double buffering exists for: a 1×1 projection has an arithmetic
-intensity of ~8 ops/DRAM byte, well under the int8 ridge point of 32, so DMA
-and MXU cost about the same per tile and overlapping them is worth nearly 2×.
+intensity of ~8 ops/DRAM byte, well under the int8 ridge point of 32, so DMA and
+MXU cost about the same per tile and overlapping them is worth nearly 2×.
 
 | | unscheduled | scheduled |
 |---|---|---|
-| **cycles** | **58,066** | **33,071** |
-| MXU busy / sem-stall / res-stall / idle | 16,488 / 37,426 / 18 / 4,134 | 16,488 / 12,434 / 18 / 4,131 |
-| VPU | 12,324 / 42,629 / 20 / 3,093 | 12,324 / 17,638 / 18 / 3,091 |
-| DMA0 | 29,040 / 29,004 / 21 / 1 | 17,583 / 14,447 / 14 / 1,027 |
-| DMA1 | 0 / 0 / 0 / 58,066 | 19,643 / 8,226 / 12 / 5,190 |
-| dispatcher stalled | 37,264 | 21,570 |
+| **cycles** | **58,070** | **36,190** |
+| MXU busy / sem-stall / res-stall / idle | 16,488 / 37,430 / 18 / 4,134 | 16,488 / 15,549 / 21 / 4,132 |
+| VPU | 12,324 / 42,633 / 20 / 3,093 | 12,324 / 20,757 / 19 / 3,090 |
+| DMA0 | 29,040 / 29,008 / 21 / 1 | 22,784 / 13,387 / 15 / 4 |
+| DMA1 | 0 / 0 / 0 / 58,070 | 14,444 / 12,388 / 10 / 9,348 |
+| dispatcher stalled | 37,267 | 24,686 |
 | DRAM bytes | 328,896 | 328,896 |
-| max queue depth (MXU / VPU / DMA0 / DMA1) | 16 / 14 / 14 / 0 | 16 / 12 / 8 / 10 |
 
 Read three things off it:
 
 * **Busy cycles are identical on every compute unit.** The pass does not remove
-  work; it removes waiting. MXU semaphore stall falls from 37,426 to 12,434 and
-  VPU's from 42,629 to 17,638 — 50,000 cycles of stall recovered out of a
-  25,000-cycle saving, because the units now stall *concurrently* instead of in
-  series.
-* **The second engine goes from idle for the entire run to carrying 19,643
-  busy cycles.** Total DMA busy rises (29,040 → 37,226) because two concurrent
-  transfers each get 8 B/cycle rather than 16, exactly MICROARCH.md §6.3 — the
-  second engine buys concurrency, not bandwidth, and the concurrency is worth
-  far more than the contention costs.
+  work; it removes waiting. MXU semaphore stall falls by 22,000 cycles and VPU's
+  by 22,000, because the units now stall *concurrently* instead of in series.
+* **The second engine goes from idle for the entire run to carrying 14,444 busy
+  cycles**, and it earns them: DMA0 falls from 29,040 to 22,784, so the split is
+  genuine concurrency rather than the same stream cut in half (§2.2).
 * **DRAM bytes are unchanged**, which is the check that this is a scheduling
   result and not an accidental change of program.
 
@@ -463,43 +592,47 @@ Read three things off it:
 
 | | unscheduled | scheduled |
 |---|---|---|
-| **cycles** | **120,642** | **92,750** |
-| MXU | 73,912 / 38,482 / 18 / 8,230 | 73,912 / 10,593 / 19 / 8,226 |
-| VPU | 12,716 / 84,709 / 20 / 23,197 | 12,716 / 65,848 / 16 / 14,170 |
-| DMA0 | 33,800 / 78,552 / 21 / 8,269 | 20,052 / 29,596 / 12 / 43,090 |
-| DMA1 | 0 / 0 / 0 / 120,642 | 20,052 / 34,830 / 12 / 37,856 |
-| dispatcher stalled | 95,830 | 67,938 |
+| **cycles** | **122,002** | **87,896** |
+| MXU | 74,096 / 43,738 / 34 / 4,134 | 74,096 / 9,638 / 32 / 4,130 |
+| VPU | 13,016 / 88,157 / 40 / 20,789 | 13,016 / 65,580 / 33 / 9,267 |
+| DMA0 | 34,456 / 79,160 / 41 / 8,345 | 34,126 / 53,742 / 24 / 4 |
+| DMA1 | 0 / 0 / 0 / 122,002 | 7,086 / 907 / 6 / 79,897 |
+| dispatcher stalled | 109,334 | 75,246 |
 
-The ceiling here is low and it is not the scheduler's: **MXU busy is 73,912 of
-the 92,750 cycles, so the layer is 80% MXU-occupied and no amount of overlap
-can do much better.** The residual 10,593 cycles of MXU semaphore stall are the
-`-kea-tile` decision described in §9: this tile's ACC region is 32,768 words,
-the whole accumulator, so the two ACC regions cannot both be live and tile
-*N+1*'s `MATMUL`s must wait for tile *N*'s `VQUANT`.
+The ceiling here is low and it is not the scheduler's: **MXU busy is 74,096 of
+the 87,896 cycles, so the layer is 84% MXU-occupied** and no amount of overlap
+can do much better. MXU semaphore stall falls from 43,738 to 9,638 — most of
+what was available has been taken. The residual is the `-kea-tile` decision in
+§10: with `spm-reserve-factor` now applied to ACC this is much better than it
+was, but a tile that fills the accumulator still forces tile *N+1*'s `MATMUL`s
+to wait for tile *N*'s `VQUANT`.
+
+Note DMA1 takes only 7,086 cycles of the 41,212 of DMA work. That is the
+spillover policy doing its job: this layer is MXU bound, so a second engine has
+nothing to overlap with and splitting the stream would only halve the port.
 
 ### 8.4 Per-unit breakdown — the MobileNetV2 inverted-residual block
 
 | | unscheduled | scheduled |
 |---|---|---|
-| **cycles** | **2,750** | **2,132** |
-| MXU | 290 / 1,849 / 15 / 596 | 290 / 1,508 / 18 / 316 |
-| DWU | 152 / 1,187 / 8 / 1,403 | 152 / 905 / 10 / 1,065 |
-| VPU | 611 / 1,955 / 19 / 165 | 611 / 1,341 / 16 / 164 |
-| DMA0 | 1,504 / 1,228 / 17 / 1 | 894 / 1,223 / 14 / 1 |
-| DMA1 | 0 / 0 / 0 / 2,750 | 734 / 906 / 11 / 481 |
-| dispatcher stalled | 893 | 321 |
-| instructions | 91 | 103 |
+| **cycles** | **2,755** | **2,135** |
+| MXU | 290 / 1,853 / 15 / 597 | 290 / 1,513 / 16 / 316 |
+| DWU | 152 / 1,190 / 8 / 1,405 | 152 / 936 / 9 / 1,038 |
+| VPU | 611 / 1,960 / 19 / 165 | 611 / 1,348 / 14 / 162 |
+| DMA0 | 1,504 / 1,233 / 17 / 1 | 1,259 / 860 / 12 / 4 |
+| DMA1 | 0 / 0 / 0 / 2,755 | 363 / 14 / 5 / 1,753 |
+| dispatcher stalled | 896 | 232 |
+| DRAM bytes | 9,204 | 9,204 |
 
 This is the hardest case for a scheduler and the most honest one to report:
-three layers of 8×8×24, each a single tile, each reading its input from the
-DRAM the previous one wrote (DIALECT_L2.md §9 — inter-layer SPM residency is not
+three layers of 8×8×24, each a single tile, each reading its input from the DRAM
+the previous one wrote (DIALECT_L2.md §9 — inter-layer SPM residency is not
 implemented). The dependence chain
-`DMA_LD → MATMUL → VQUANT → DMA_ST → DMA_LD → …` is almost the whole program,
-so there is very little *within* a layer to overlap. The 1.29× comes from
+`DMA_LD → MATMUL → VQUANT → DMA_ST → DMA_LD → …` is almost the whole program, so
+there is very little *within* a layer to overlap. The 1.29× comes from
 prefetching each layer's **weights and quantization parameters** — which depend
-on nothing — under the previous layer's compute, and from putting the store of
-layer *n* and the weight load of layer *n+1* on different engines. Eleven of
-the 91 instructions move earlier.
+on nothing — under the previous layer's compute, and from spilling 363 cycles of
+that onto the second engine while DMA0 is busy.
 
 The scheduled program passes `kea-sim --strict-hazards --strict-poison`, which
 makes an unsynchronized cross-unit read and a read of never-written scratchpad
@@ -508,56 +641,79 @@ sufficient for the numbers to come out.
 
 ### 8.5 What the pass's own model predicts
 
-`report-schedule=true` publishes `modelled_cycles`, and it is close enough to be
-useful and far enough to be worth stating:
+`report-schedule=true` publishes `modelled_cycles`, and its accuracy is what
+makes `mode=auto` possible at all:
 
 | program | modelled | measured | error |
 |---|---:|---:|---:|
-| MobileNetV2 block, scheduled | 2,098 | 2,132 | −1.6% |
-| MobileNetV2 block, serial | 2,903 | 2,750 | +5.6% |
-| `@pointwise_64_to_16`, scheduled | 30,022 | 33,071 | −9.2% |
+| 28-conv prefix, reserve 1, in-order plan | 2,124,565 | 2,126,037 | −0.07% |
+| 28-conv prefix, reserve 1, overlap plan | 2,262,240 | 2,264,218 | −0.09% |
+| MobileNetV2 block, scheduled | 2,098 | 2,135 | −1.7% |
+| MobileNetV2 block, serial | 2,903 | 2,755 | +5.4% |
 
-The model is optimistic on the big cases because it does not simulate
-instructions backing up behind a blocked `WAIT` at a queue head. It is used for
-*choosing* between candidates, where only the ordering of the estimates matters,
-never for reporting.
+The two rows that matter are the first two: on the program where the decision is
+close and wrong the wrong way round, the model is within 0.1% of `kea-sim` on
+*both* plans and picks correctly. On small programs it is optimistic by a few
+percent, because it does not simulate instructions backing up behind a blocked
+`WAIT` at a queue head — but there the two plans differ by 20% or more, so the
+error cannot flip the decision.
 
 ---
 
-## 9. What is not implemented, and what this pass found
+## 9. `mode=auto`: when the pass declines, and whether `--schedule` should be on
+
+Reordering is not free. §6's soundness obligation is discharged with real
+dependence edges, and on a program with no room to double buffer those edges are
+pure cost. So the default mode costs both plans with the same model and emits
+the cheaper one:
+
+| mode | what it emits |
+|---|---|
+| `auto` (default) | the cheaper of the two, by modelled cycles; falls back further if neither fits |
+| `overlap` | always the reordered plan |
+| `serial` | never reorders, synchronizes every cross-queue adjacency — the A/B control §8 measures against |
+
+The in-order plan is a faithful model of what the backend emits *without* this
+pass: `-kea-tile`'s order, one engine, minimal storage-derived sync — the same
+thing `kea-translate --sync=auto` inserts. Costing it with the same cost model
+is what makes the comparison meaningful.
+
+`auto` also enforces that the plan it emits is *placeable*. A plan whose widened
+ranges `-kea-alloc` provably cannot place is rejected in favour of the in-order
+one, and if neither fits, of `serial` — which always fits, because nothing in it
+is concurrent and every range is the one `-kea-tile` sized. Turning this pass's
+aggressiveness into the next pass's failure is not an acceptable outcome.
+
+**Should `--schedule` be on by default? Yes — with `mode=auto`, and with
+`--spm-reserve` at 2 or more.** With `auto` the pass cannot lose: it is worth
+1.5× where there is room to double buffer, and it declines where there is not,
+costing nothing measurable (1.002× on both multi-layer programs at reserve 1).
+Without `auto` — i.e. `mode=overlap` — it should *not* be on by default, because
+at `--spm-reserve 1` it costs 6%.
+
+## 10. What is not implemented, and what this pass found
 
 Stated plainly rather than stubbed.
 
-* **No software pipelining across the `mode=serial` boundary.** `serial` is a
-  measurement control, not a fallback strategy; the only time the pass emits it
-  automatically is if the buffers-in-flight fixpoint bottoms out at *K* = 1 and
-  the ranges still do not fit, which means `-kea-tile`'s own tiles do not fit
-  and is that pass's diagnostic to give.
+* **`serial` is a measurement control, not a strategy.** The pass emits it
+  automatically only when neither the overlapped nor the in-order plan is
+  placeable (§9), which means `-kea-tile`'s own tiles do not fit and is that
+  pass's diagnostic to give.
 * **No MXU reordering, ever.** DIALECT_L2.md §6.1 makes bank assignment
   `-kea-tile`'s job and final. A scheduler that renumbered banks could shorten
   some MXU stalls; it would also have to re-derive `accumulate`, and the payoff
   is small because the MXU queue is already dense.
 * **The queue model does not simulate head-of-line blocking.** §4.1.
-* **`-kea-tile` does not reserve ACC.** `spm-reserve-factor` divides SPM_A and
-  SPM_W but the ACC constraint in DIALECT_L2.md §5.2 is
-  `OCG_t·OH_t·OW_t·16 ≤ KEA_ACC_WORDS` with no reserve, so the tiler routinely
-  hands one tile the entire accumulator — and then §5.3's cost model prices the
-  MXU, VPU and DMA terms as `max(…)`, i.e. it *assumes* the overlap that a
-  full-ACC tile makes impossible. The scheduler cannot fix this from below: with
-  one ACC region there is a genuine MXU→VPU→MXU serialization every tile. On
-  `@conv_tile_loop` that is the entire residual 10,593 cycles of MXU semaphore
-  stall. **The fix belongs in `-kea-tile`**: apply the reserve factor to
-  `KEA_ACC_WORDS` as well, or add an `acc-reserve-factor`.
-* **`-kea-tile` reuses one `name` for every spatial tile of a layer.** Both
-  tiles of `@conv_tile_loop` get `kea.alloc {name = "conv_tile_loop.0.atile"}`,
-  which DIALECT_L2.md §4.1 says must be unique in the module and which
-  `kea-translate` rejects outright. It does not affect scheduling or allocation
-  (both key on the SSA value), and it does not show up on single-tile layers
-  like the MobileNetV2 block, but it stops any genuinely tiled layer from
-  reaching `.kasm` through the real backend — which is why §8's two tiled
-  measurements use the harness's own `--emitter=builtin` transcription.
-  **The fix belongs in `-kea-tile`**: suffix the name with the tile index.
-* **Regions overlap after software pipelining.** §7. Correct, and worth knowing
-  before reading a per-layer roofline.
+* **The IMEM ceiling is what is costing the whole-network speedup.** §8.1.1: at
+  `--spm-reserve 1` the scheduler correctly declines, and at 2 or 3 it is worth
+  1.48–1.64× — but the whole feature extractor only fits in IMEM at reserve 1
+  (`demo/repro/run_repro.sh` defect 4). **The fix belongs in `-kea-tile`**, and
+  it is the highest-value item left in the backend.
+* **Regions overlap after software pipelining.** §7. Bounded now, but still
+  worth knowing before reading a per-layer roofline.
+* **The fit predicate is `maxlive`, not the allocator's own packing.** §6.3
+  handles the gap with a margin rather than by reimplementing
+  `-kea-alloc`'s greedy first fit. A scheduler that ran the real packer could
+  drop the margin and take the ~9% back.
 * **No cross-function scheduling.** The pass is per `func.func`, and a Level 2
   function is one block by construction.

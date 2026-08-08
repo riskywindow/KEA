@@ -45,12 +45,12 @@
 // is what `refreshLiveRanges()` and `-kea-alloc` both re-derive the range from.
 //
 // RANGES-LABEL: func.func @two_tiles
-// RANGES: kea.alloc {live = array<i64: 6, 17>, name = "t.a0"
-// RANGES: kea.alloc {live = array<i64: 7, 22>, name = "t.a1"
-// RANGES: kea.alloc {live = array<i64: 12, 35>, name = "t.o0"
+// RANGES: kea.alloc {live = array<i64: 3, 17>, name = "t.a0"
+// RANGES: kea.alloc {live = array<i64: 4, 22>, name = "t.a1"
+// RANGES: kea.alloc {live = array<i64: 12, 32>, name = "t.o0"
 // RANGES: kea.alloc {live = array<i64: 16, 27>, name = "t.c0"
-// RANGES: kea.alloc {live = array<i64: 21, 31>, name = "t.c1"
-// RANGES: kea.alloc {live = array<i64: 30, 40>, name = "t.o1"
+// RANGES: kea.alloc {live = array<i64: 21, 34>, name = "t.c1"
+// RANGES: kea.alloc {live = array<i64: 31, 38>, name = "t.o1"
 //
 // THIRD AND FOURTH RUN LINES -- the consequence. The allocator now separates
 // them for the ordinary reason, and re-running it in `verify-only` mode

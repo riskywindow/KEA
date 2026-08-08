@@ -227,8 +227,9 @@ def KeaSchedule : Pass<"kea-schedule", "::mlir::func::FuncOp"> {
     // keeps -kea-tile's order, puts every DMA on one engine and synchronizes
     // every cross-queue adjacency, i.e. it runs the sequential program as a
     // sequential program. It is what `overlap` is measured against.
-    Option<"mode", "mode", "std::string", /*default=*/"\"overlap\"",
-           "overlap (default) or serial -- the unscheduled baseline">,
+    Option<"mode", "mode", "std::string", /*default=*/"\"auto\"",
+           "auto (default: cost both and keep the better), overlap (always "
+           "reorder), or serial (never -- the unscheduled A/B baseline)">,
     // KEA_QUEUE_DEPTH from hw_config.h. Overridable only so a test can force
     // the backpressure path on a small program.
     Option<"queueDepth", "queue-depth", "int64_t", /*default=*/"0",
@@ -239,6 +240,14 @@ def KeaSchedule : Pass<"kea-schedule", "::mlir::func::FuncOp"> {
     // stronger than an attribute. This stamps the derived queue as a
     // discardable `kea.unit` attribute anyway so the assignment is readable
     // and FileCheck-testable. It is advisory; -kea-emit must not need it.
+    // -kea-alloc packs greedily by first fit, so a plan whose `maxlive` fits
+    // can still be refused for fragmentation. The scheduler gives back a
+    // little overlap to stay clear of that. 0 disables it and is worth ~9% of
+    // the speedup on programs that do fit; see docs/SCHEDULING.md §6.3.
+    Option<"fragmentationMargin", "fragmentation-margin", "int64_t",
+           /*default=*/"6",
+           "Percent of each scratchpad to leave unclaimed as headroom for "
+           "-kea-alloc's greedy packer; 0 to use all of it">,
     Option<"annotateUnits", "annotate-units", "bool", /*default=*/"true",
            "Stamp the derived queue on fixed-unit ops as `kea.unit`">,
     // Statistics are inert on this LLVM install (Release+NDEBUG =>

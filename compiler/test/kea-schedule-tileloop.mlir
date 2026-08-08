@@ -36,11 +36,11 @@
 // The buffers-in-flight bound is what stops the scheduler running so far ahead
 // that -kea-alloc cannot fit the widened live ranges. It starts at what the
 // extents allow (six of SPM_A's eight tile buffers) and the capacity fixpoint
-// walks it down to four -- three iterations -- because the *extended* ranges
-// need more room than the emission-order ones. The resulting SPM_A peak,
-// 229456 bytes, is what -kea-alloc is then asked to fit into 262144.
+// walks it down -- three iterations -- because the *extended* ranges need more
+// room than the emission-order ones, and because the loop keeps going until
+// each space is inside its 15/16 anti-fragmentation margin.
 // REPORT-LABEL: func.func @pointwise_64_to_16(
-// REPORT-SAME:  buffers_in_flight = [4, 2, 2]
+// REPORT-SAME:  buffers_in_flight = [4, 2, 1]
 // REPORT-SAME:  capacity_iters = 3 : i64
 // REPORT-SAME:  queue_depth = 16 : i64
 // REPORT-SAME:  DMA0 = {busy = {{[1-9][0-9]*}} : i64

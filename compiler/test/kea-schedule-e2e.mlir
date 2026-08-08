@@ -19,7 +19,9 @@
 //   2. re-running `-kea-alloc` in verify-only mode re-proves from scratch that
 //      no two overlapping-live-range buffers share storage;
 //   3. the schedule report: both DMA engines carry work, the depth-16 queues
-//      are respected, and the whole block needs 18 of the 32 events;
+//      are respected, the whole block needs 15 of the 32 events, and the
+//      modelled cost of overlapping (2098) beats the modelled cost of not
+//      (2522), which is why `mode=auto` emits the overlapped plan;
 //   4. running `-kea-tile` over already-Level-2 IR re-runs `verifyWeightBanks`
 //      and `refreshLiveRanges` (DIALECT_L2.md §2), so errata E7 and the
 //      live-range stamps are re-checked after all the motion.
@@ -35,12 +37,13 @@
 // CHECK-DAG: kea.trace "begin" 1 {unit = "DWU"}
 // CHECK-DAG: kea.trace "begin" 2 {unit = "MXU"}
 // CHECK-DAG: kea.trace "end" 2 {unit = "MXU"}
-// Both DMA engines are used, every instruction has a queue, and the
-// semaphores are there.
+// Both DMA engines carry loads -- the second one takes a descriptor exactly
+// when the first is still busy, which is when a second engine buys anything
+// (SCHEDULING.md §2.2) -- every instruction has a queue, and the semaphores
+// are there.
 // CHECK-DAG: kea.dma_load {{.*}}unit = "DMA0"
 // CHECK-DAG: kea.dma_load {{.*}}unit = "DMA1"
 // CHECK-DAG: kea.dma_store {{.*}}unit = "DMA0"
-// CHECK-DAG: kea.dma_store {{.*}}unit = "DMA1"
 // CHECK-DAG: kea.dwconv {{.*}}kea.unit = "DWU"
 // CHECK-DAG: kea.vadd {{.*}}kea.unit = "VPU"
 // CHECK-DAG: kea.signal
@@ -56,14 +59,19 @@
 // One pass of the capacity fixpoint: the buffers-in-flight bound each space
 // started from was admissible first time.
 // REPORT-SAME:  capacity_iters = 1 : i64
-// REPORT-SAME:  events = 18 : i64
+// REPORT-SAME:  events = 15 : i64
+// The two plans are costed with the same model and the overlapped one wins,
+// so that is what is emitted (SCHEDULING.md §9).
+// REPORT-SAME:  mode = "overlap"
+// REPORT-SAME:  modelled_in_order = 2522 : i64
+// REPORT-SAME:  modelled_overlap = 2098 : i64
 // REPORT-SAME:  queue_depth = 16 : i64
 // Both engines carry real DRAM traffic, and neither queue reaches its depth.
 // REPORT-SAME:  DMA0 = {busy = {{[1-9][0-9]*}} : i64, dram_bytes = {{[1-9][0-9]*}} : i64
 // REPORT-SAME:  DMA1 = {busy = {{[1-9][0-9]*}} : i64, dram_bytes = {{[1-9][0-9]*}} : i64
 // The whole block needs well under either scratchpad even with the widened
-// ranges: 8144 of 262144 bytes of SPM_A.
-// REPORT-SAME:  spm_a_peak = 8144 : i64
+// ranges: 11248 of 262144 bytes of SPM_A.
+// REPORT-SAME:  spm_a_peak = 11248 : i64
 // REPORT-SAME:  spm_w_peak = 2292 : i64
 
 // REVALIDATE-LABEL: func.func @mobilenet_v2_inverted_residual(

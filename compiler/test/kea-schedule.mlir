@@ -36,8 +36,13 @@
 // CHECK-DAG: kea.vquant {{.*}}kea.unit = "VPU"
 // CHECK-DAG: kea.dma_load {{.*}}unit = "DMA0"
 // CHECK-DAG: kea.dma_load {{.*}}unit = "DMA1"
-// CHECK-DAG: kea.dma_store {{.*}}unit = "DMA1"
+// CHECK-DAG: kea.dma_store {{.*}}unit = "DMA
+// The store lands on DMA0 here, not DMA1: with one descriptor in flight at a
+// time the second engine would start it no earlier and both would then share
+// the 16 B/cycle DRAM port. DMA1 is spillover, not load balancing (§2.2).
+// CHECK-NOT: unit = "DMA1"
 // REPORT-LABEL: func.func @unit_assignment
+// REPORT-SAME:  mode = "overlap"
 // REPORT-SAME:  MXU = {busy = 78 : i64, instrs = 2 : i64
 func.func @unit_assignment() {
   %dw = kea.alloc {name = "u.dw", role = "weights"} : !kea.buffer<256xi8, DRAM>
@@ -186,13 +191,14 @@ func.func @no_sync_within_a_queue() {
 // CHECK:       kea.dma_load %{{[0-9]+}} -> %[[A1:[0-9]+]] {{.*}}<4096xi8, DRAM> -> !kea.buffer<1040xi8, A>
 // CHECK:       kea.mm %[[A0]],
 // CHECK:       kea.mm %[[A1]],
-// The two loads go to different engines, and so do the two stores, so a
-// prefetch and a write-back are in flight at the same time (ISA.md §12).
+// The activation loads go to different engines, so tile 1 is being fetched
+// while tile 0 is being multiplied (ISA.md §12). The stores stay on DMA0: by
+// the time they are ready nothing else is in flight, and splitting them would
+// only make both share the 16 B/cycle DRAM port -- see §2.2.
 // ENGINES-LABEL: func.func @prefetch_is_hoisted
 // ENGINES-DAG:   kea.dma_load {{.*}}unit = "DMA0"
 // ENGINES-DAG:   kea.dma_load {{.*}}unit = "DMA1"
 // ENGINES-DAG:   kea.dma_store {{.*}}unit = "DMA0"
-// ENGINES-DAG:   kea.dma_store {{.*}}unit = "DMA1"
 // Both engines carry work, and the depth-16 queues are modelled and respected.
 // REPORT-LABEL: func.func @prefetch_is_hoisted
 // REPORT-SAME:  queue_depth = 16 : i64
@@ -361,9 +367,12 @@ func.func @weight_banks_preserved() {
 // SERIAL: kea.wait 1 {unit = "DMA0"}
 // SERIAL: kea.dma_store {{.*}}unit = "DMA0"
 // SERIAL-NOT: unit = "DMA1"
-// The overlapped schedule puts the store on the second engine instead.
+// The overlapped schedule is free to use the second engine but does not need
+// to here: one load, one copy, one store, nothing concurrent. What it does drop
+// is the baseline's redundant handshake -- the vcopy reads %a and the store
+// reads %b, so DMA0 never has to wait for the VPU twice.
 // CHECK-LABEL: func.func @serial_baseline
-// CHECK: kea.dma_store {{.*}}unit = "DMA1"
+// CHECK: kea.dma_store {{.*}}unit = "DMA0"
 
 // RUN: kea-opt %s -split-input-file -kea-schedule=mode=serial | FileCheck %s --check-prefix=SERIAL
 func.func @serial_baseline() {

@@ -163,12 +163,22 @@ def KeaTile : Pass<"kea-tile", "::mlir::func::FuncOp"> {
     // -kea-schedule needs room to double-buffer; if -kea-tile filled the
     // scratchpad exactly, nothing downstream could overlap DMA with compute.
     // 2 means "half of each scratchpad", i.e. one spare set of tiles.
-    Option<"spmReserveFactor", "spm-reserve-factor", "int64_t", /*default=*/"2",
+    Option<"spmReserveFactor", "spm-reserve-factor", "int64_t", /*default=*/"1",
            "Divide each scratchpad's capacity by this before tiling, leaving "
            "room for -kea-schedule to double-buffer">,
     // Statistics are inert on this LLVM (Release+NDEBUG => NoopStatistic; see
     // compiler/README.md gotcha 21a), so publish the chosen tiles as an
     // attribute instead. This is what the tests assert against.
+    // KEA-1 is branchless, so every tile of every layer is straight-line code
+    // and the tile count IS the program size. IMEM holds 32768 instructions
+    // and is not paged, which makes program size a hard capacity limit exactly
+    // like SPM_A -- but a global one, so it cannot be respected by choosing
+    // each layer's tile greedily. This is the whole-function budget the
+    // planner spends; leave headroom for the SIGNAL/WAIT pairs -kea-schedule
+    // and kea-translate add afterwards (measured at 44-61% of the tiled
+    // program on MobileNetV2 -- see docs/DIALECT_L2.md §5.5).
+    Option<"imemBudget", "imem-budget", "int64_t", /*default=*/"20480",
+           "Whole-function KEA-1 instruction budget the tiler plans against">,
     Option<"reportTiles", "report-tiles", "bool", /*default=*/"false",
            "Attach the chosen tile shapes and their scratchpad footprints to "
            "the function as kea.tiling">,

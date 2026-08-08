@@ -219,3 +219,24 @@ func.func @e7_unwritten_weight_bank() {
     : !kea.buffer<1616xi8, A>, !kea.buffer<2048xi32, ACC>
   return
 }
+
+//===--------------------------------------------------------------------===//
+// Activation-by-activation matmul
+//===--------------------------------------------------------------------===//
+//
+// The MXU is weight stationary: -kea-tile turns a matmul's second operand into
+// a DRAM weight blob that -kea-emit lays out as 16x16 tiles, so it has to be a
+// constant. Before this was diagnosed the pass built a kea.alloc with a null
+// source and the failure surfaced as "null operand found" from the verifier,
+// pointing at nothing useful.
+
+func.func @matmul_activation_rhs(%a: tensor<1x8x16xi8>, %b: tensor<1x16x32xi8>)
+    -> tensor<1x8x32xi8> {
+  // expected-error @+1 {{cannot lower a matmul whose right-hand side is an activation rather than a compile-time constant}}
+  %0 = kea.matmul %a, %b {zero_points = #kea.zp<input = 0, weight = 0>,
+        epilogue = #kea.epilogue<requant = <multiplier = [1073741824],
+                    shift = [36], input_zp = 0, output_zp = -128, axis = -1,
+                    rounding = DOUBLE>>}
+    : (tensor<1x8x16xi8>, tensor<1x16x32xi8>) -> tensor<1x8x32xi8>
+  return %0 : tensor<1x8x32xi8>
+}

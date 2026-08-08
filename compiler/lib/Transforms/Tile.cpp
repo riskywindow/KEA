@@ -251,7 +251,34 @@ struct ConvTiling {
   int64_t ihP = 0, iwP = 0;   // padded input tile extent
   int64_t inBytes = 0, outBytes = 0, wBytes = 0, qpBytes = 0, accWords = 0;
   uint64_t cycles = 0;
+  /// True when two of these tiles fit in every scratchpad they touch, i.e.
+  /// when `-kea-schedule` can prefetch the next tile under this one's compute.
+  bool doubleBufferable = false;
+  /// KEA-1 instructions this tiling emits. The ISA has no loops, so the tile
+  /// count IS the program size and this is a hard, exactly-known resource --
+  /// see the note on `Candidates` below.
+  int64_t instrs = 0;
 };
+
+/// One layer's feasible tilings, reduced to the Pareto frontier of
+/// (instructions, cycles).
+///
+/// WHY THIS IS A SET AND NOT A SINGLE CHOICE
+/// -----------------------------------------
+/// KEA-1 is branchless (ISA.md §1): every tile of every layer is written out as
+/// straight-line code, so halving a tile doubles that layer's contribution to
+/// program size. IMEM holds KEA_MAX_INSTRUCTIONS = 32768 instructions and is
+/// not paged, which makes program size a *capacity* constraint exactly like
+/// SPM_A or ACC -- and unlike them it is global, so no per-layer greedy choice
+/// can respect it.
+///
+/// Picking the cycle-minimal tiling per layer therefore overruns IMEM on
+/// MobileNetV2's feature extractor. Picking the instruction-minimal one wastes
+/// cycles. The two objectives genuinely conflict and the right balance is not
+/// uniform across layers: the early 112x112 layers dominate instruction count
+/// while the late 7x7 layers dominate weight traffic. So each layer publishes
+/// its whole frontier and `solveTilingBudget()` chooses across layers.
+using Candidates = SmallVector<ConvTiling, 8>;
 
 /// Occupancy of one spatial tile on each of the three concurrent resources,
 /// straight out of hw_config.h. `-kea-schedule` overlaps them, so the tile's
@@ -259,8 +286,45 @@ struct ConvTiling {
 /// one, but the tile size must be chosen as though it will.
 struct TileCost {
   uint64_t mxu = 0, vpu = 0, dma = 0;
-  uint64_t bound() const { return std::max(mxu, std::max(vpu, dma)); }
+
+  /// Cycles per tile, given whether the tile leaves room to double-buffer.
+  ///
+  /// This is the one place the cost model touches `-kea-schedule`'s job, and
+  /// it has to: a tile that occupies more than half of a scratchpad cannot
+  /// have its successor prefetched into the other half, so its DMA cannot hide
+  /// under its compute and the three resources run back to back instead of
+  /// concurrently. Pricing every tile at `max()` regardless would tell the
+  /// search that a tile twice as large is free, which is exactly wrong -- and
+  /// pricing every tile at `sum()` would give up the overlap the two DMA
+  /// engines exist for (ISA.md §12).
+  /// Cycles that do NOT overlap with anything, however well the tile is
+  /// scheduled. Every tile boundary is a cross-unit hand-off, and ISA.md §5.3
+  /// is explicit that a `SIGNAL` "costs the unit's pipeline depth (32 cycles
+  /// for MXU, 12 for DWU, 8 for VPU)" because it is a local drain barrier.
+  /// A tile loop therefore pays those drains once per tile no matter what
+  /// `-kea-schedule` does with the rest.
+  ///
+  /// Leaving this out is what made the search prefer tiles that are too small:
+  /// halving a tile halves each resource term, so a model without a per-tile
+  /// floor sees no cost at all in doubling the tile count. Measured on
+  /// MobileNetV2's feature extractor, the un-penalised model ranked a
+  /// 20,801-instruction plan above a 19,909-instruction one while the
+  /// simulator put them at 3,179,147 and 3,133,342 cycles respectively -- the
+  /// wrong way round.
+  uint64_t sync = 0;
+
+  uint64_t bound(bool doubleBufferable) const {
+    return sync + (doubleBufferable ? std::max(mxu, std::max(vpu, dma))
+                                    : mxu + vpu + dma);
+  }
 };
+
+/// The unavoidable per-tile drain: the producing unit's pipeline has to empty
+/// before the consumer's `WAIT` can be released.
+constexpr uint64_t kMxuTileSync =
+    ::kea::KEA_MXU_PIPELINE_DEPTH + ::kea::KEA_VPU_PIPELINE_DEPTH;
+constexpr uint64_t kDwuTileSync =
+    ::kea::KEA_DWU_PIPELINE_DEPTH + ::kea::KEA_VPU_PIPELINE_DEPTH;
 
 TileCost costConvTile(const ConvShape &s, const ConvTiling &t) {
   TileCost c;
@@ -290,6 +354,7 @@ TileCost costConvTile(const ConvShape &s, const ConvTiling &t) {
           ::kea::keaDmaOccupancy(static_cast<uint32_t>(t.ocgT * kMxuN),
                                  static_cast<uint32_t>(t.owT),
                                  static_cast<uint32_t>(t.ohT));
+  c.sync = kMxuTileSync;
   return c;
 }
 
@@ -297,8 +362,78 @@ TileCost costConvTile(const ConvShape &s, const ConvTiling &t) {
 /// would need its own instruction sequence and buys nothing on the shapes
 /// MobileNetV2 actually has (every feature map is a power of two times a small
 /// odd number).
-std::optional<ConvTiling> chooseConvTiling(const ConvShape &s,
-                                           int64_t spmReserve) {
+/// Instructions `lowerContraction` will emit for this tiling. Counted, not
+/// estimated: every term below is a `b.create<...>` in that function, and the
+/// whole-function total is asserted against the emitted program in `run()`.
+int64_t instrsForConvTiling(const ConvShape &s, const ConvTiling &t,
+                            bool residual) {
+  const int64_t nSpatial = (s.OH / t.ohT) * (s.OW / t.owT);
+  const int64_t nOcTiles = ceilDiv(s.ocGroups(), t.ocgT);
+
+  // Hoisted out of the spatial loop, once per output-channel tile: the weight
+  // DMA, the KeaQuantParam DMA and (with a residual) the KeaAddParam DMA.
+  const int64_t perOcTile = 2 + (residual ? 1 : 0);
+
+  // Per spatial tile, per output-channel tile: the halo fill, the activation
+  // load and the output store, plus the residual load and add.
+  const int64_t perSpatialPerOcTile = 3 + (residual ? 2 : 0);
+
+  // The residual tile also needs its channel padding defined before VADD reads
+  // it -- but only on an output-channel tile whose real channel count is short
+  // of the padded one, which is at most the last tile of each spatial step.
+  const int64_t residualPadFills =
+      (residual && (s.OC % (t.ocgT * kMxuN)) != 0) ? nSpatial : 0;
+
+  // Per spatial tile, summed over every output-channel group of every
+  // output-channel tile (which is just `ocGroups`): one LOAD_W + one MATMUL per
+  // tap per reduction tile, then one VQUANT for the group.
+  const int64_t perOcGroup = 2 * s.icTiles() * s.tapsPerGroup() + 1;
+
+  return 2 /*TRACE begin/end*/ +
+         s.batch * (nOcTiles * perOcTile + residualPadFills +
+                    nSpatial * (nOcTiles * perSpatialPerOcTile +
+                                s.ocGroups() * perOcGroup));
+}
+
+/// Reduce a candidate list to the Pareto frontier of (instructions, cycles):
+/// keep a tiling only if nothing else is both no larger and no slower.
+void paretoPrune(Candidates &c) {
+  llvm::sort(c, [](const ConvTiling &a, const ConvTiling &b) {
+    if (a.instrs != b.instrs)
+      return a.instrs < b.instrs;
+    if (a.cycles != b.cycles)
+      return a.cycles < b.cycles;
+    // Deterministic tie-break, so the pass is reproducible.
+    return std::tie(a.ohT, a.owT, a.ocgT) > std::tie(b.ohT, b.owT, b.ocgT);
+  });
+  Candidates keep;
+  uint64_t bestCycles = ~uint64_t(0);
+  for (const ConvTiling &t : c)
+    if (t.cycles < bestCycles) {
+      bestCycles = t.cycles;
+      keep.push_back(t);
+    }
+  c = std::move(keep);
+}
+
+/// The cheapest candidate under the Lagrangian objective `cycles + lambda *
+/// instructions`. `lambda` is a price in cycles per instruction: 0 means
+/// "ignore program size", large means "ignore cycles".
+const ConvTiling &pickUnderPrice(const Candidates &c, double lambda) {
+  const ConvTiling *best = &c.front();
+  double bestScore = c.front().cycles + lambda * c.front().instrs;
+  for (const ConvTiling &t : c) {
+    double score = t.cycles + lambda * t.instrs;
+    if (score < bestScore) {
+      bestScore = score;
+      best = &t;
+    }
+  }
+  return *best;
+}
+
+Candidates enumerateConvTilings(const ConvShape &s, int64_t spmReserve,
+                                bool residual) {
   const int64_t spmABudget = kSpmABytes / spmReserve;
   const int64_t spmWBudget = kSpmWBytes / spmReserve;
   // ACC is on-chip memory and needs double-buffering headroom for exactly the
@@ -308,7 +443,7 @@ std::optional<ConvTiling> chooseConvTiling(const ConvShape &s,
   // semaphore stall on a conv tile loop before this was applied.
   const int64_t accBudget = kAccWords / spmReserve;
 
-  std::optional<ConvTiling> best;
+  Candidates out;
   for (int64_t ohT : divisorsOf(s.OH)) {
     if (ohT > kDmaMaxN2) // output DMA uses n2 = ohT
       break;
@@ -368,18 +503,112 @@ std::optional<ConvTiling> chooseConvTiling(const ConvShape &s,
         const uint64_t weightDma =
             ::kea::keaDmaOccupancy(static_cast<uint32_t>(wBytes), 1, 1) +
             ::kea::keaDmaOccupancy(static_cast<uint32_t>(qpBytes), 1, 1);
+        // Can `-kea-schedule` keep two of these live at once? That decides
+        // whether the tile's DMA hides under its compute. With
+        // `spm-reserve-factor >= 2` every candidate that got this far already
+        // satisfies it by construction, so this only bites at reserve 1, where
+        // the search may pick a tile that fills the scratchpad.
+        t.doubleBufferable =
+            2 * (inBytes + outBytes) <= kSpmABytes &&
+            2 * accWords <= kAccWords && 2 * (wBytes + qpBytes) <= kSpmWBytes;
         t.cycles = static_cast<uint64_t>(nOcTiles) *
-                   (weightDma + static_cast<uint64_t>(nSpatial) * s.batch *
-                                    costConvTile(s, t).bound());
-
-        if (!best || t.cycles < best->cycles ||
-            (t.cycles == best->cycles &&
-             ohT * owT * ocgT > best->ohT * best->owT * best->ocgT))
-          best = t;
+                   (weightDma +
+                    static_cast<uint64_t>(nSpatial) * s.batch *
+                        costConvTile(s, t).bound(t.doubleBufferable));
+        t.instrs = instrsForConvTiling(s, t, residual);
+        out.push_back(t);
+        (void)0;
       }
     }
   }
-  return best;
+  paretoPrune(out);
+  return out;
+}
+
+/// The depthwise parameters `-kea-tile` tiles over, extracted so the planning
+/// pass can cost a `kea.dwconv2d` without emitting it. Validation stays in
+/// `lowerDwconv`, which produces the diagnostics; this only succeeds for
+/// shapes that will actually lower.
+struct DwShape {
+  int64_t IH = 0, IW = 0, OH = 0, OW = 0, C = 0, cPad = 0, KH = 0, S = 1;
+};
+
+bool dwShapeFor(DWConv2DOp op, DwShape &d) {
+  auto in = shapeOf(op.getInput());
+  auto w = shapeOf(op.getWeights());
+  auto out = shapeOf(op.getOutput());
+  if (in.size() != 4 || out.size() != 4 || w.size() != 4 || in[0] != 1)
+    return false;
+  if (out[3] != in[3])
+    return false;
+  auto strides = op.getStrides();
+  auto dil = op.getDilations();
+  if (w[1] != w[2] || dil[0] != 1 || dil[1] != 1)
+    return false;
+  if (strides[0] != strides[1] || strides[0] > ::kea::KEA_DWU_MAX_STRIDE)
+    return false;
+  if (w[1] != ::kea::KEA_DWU_KERNEL_3 && w[1] != ::kea::KEA_DWU_KERNEL_5)
+    return false;
+  d.IH = in[1];
+  d.IW = in[2];
+  d.C = in[3];
+  d.OH = out[1];
+  d.OW = out[2];
+  d.KH = w[1];
+  d.S = strides[0];
+  d.cPad = roundUp(d.C, kDwuLanes);
+  return true;
+}
+
+/// Feasible depthwise tilings. There is no channel tiling: DWCONV iterates
+/// channel groups internally for the same cycle count in one instruction
+/// (ISA.md §9.1), so splitting channels would only add instructions.
+Candidates enumerateDwTilings(const DwShape &d, int64_t spmReserve) {
+  const int64_t spmABudget = kSpmABytes / spmReserve;
+  Candidates out;
+  for (int64_t ohT : divisorsOf(d.OH)) {
+    if (ohT > kDmaMaxN2)
+      break;
+    for (int64_t owT : divisorsOf(d.OW)) {
+      const int64_t ihP = (ohT - 1) * d.S + d.KH;
+      const int64_t iwP = (owT - 1) * d.S + d.KH;
+      const int64_t inBytes = ihP * iwP * d.cPad + kDwuLanes;
+      const int64_t outBytes = ohT * owT * d.cPad + kDwuLanes;
+      const int64_t accWords = ohT * owT * d.cPad;
+      if (accWords > kAccWords / spmReserve || inBytes + outBytes > spmABudget)
+        continue;
+      if (iwP * d.cPad > kDmaMaxLen0 || ihP > kDmaMaxN1)
+        continue;
+      const int64_t nSpatial = (d.OH / ohT) * (d.OW / owT);
+      const bool dbuf = 2 * (inBytes + outBytes) <= kSpmABytes &&
+                        2 * accWords <= kAccWords;
+      TileCost tc;
+      tc.mxu = ::kea::keaDwconvOccupancy(ohT, owT, d.cPad, d.KH, d.KH);
+      tc.vpu = ::kea::keaVquantOccupancy(ohT * owT, d.cPad);
+      tc.dma = ::kea::keaDmaOccupancy(iwP * d.C, ihP, 1) +
+               ::kea::keaDmaOccupancy(d.C, owT, ohT);
+      tc.sync = kDwuTileSync;
+      uint64_t cyc = tc.bound(dbuf);
+      ConvTiling t;
+      t.doubleBufferable = dbuf;
+      t.ohT = ohT;
+      t.owT = owT;
+      t.ocgT = 1;
+      t.ihP = ihP;
+      t.iwP = iwP;
+      t.inBytes = inBytes;
+      t.outBytes = outBytes;
+      t.accWords = accWords;
+      t.cycles = cyc * static_cast<uint64_t>(nSpatial);
+      // TRACE begin/end, the weight and KeaQuantParam DMAs, then per spatial
+      // tile: the halo fill, the activation load, the DWCONV, the VQUANT and
+      // the output store.
+      t.instrs = 4 + 5 * nSpatial;
+      out.push_back(t);
+    }
+  }
+  paretoPrune(out);
+  return out;
 }
 
 //===----------------------------------------------------------------------===//
@@ -458,22 +687,38 @@ namespace {
 
 class Tiler {
 public:
-  Tiler(func::FuncOp func, int64_t spmReserve)
-      : func(func), b(func.getContext()), spmReserve(spmReserve) {}
+  Tiler(func::FuncOp func, int64_t spmReserve, int64_t imemBudget)
+      : func(func), b(func.getContext()), spmReserve(spmReserve),
+        imemBudget(imemBudget) {}
 
   LogicalResult run();
 
   int64_t numLayers = 0, numTiles = 0, numMatmuls = 0;
+  int64_t emittedInstrs = 0;
+
+  /// Reporting for solveTilingBudget(): the price it settled on, the program
+  /// size and estimated cycles that bought, and the two extremes for
+  /// comparison.
+  double budgetPrice = 0.0;
+  int64_t plannedInstrs = 0, cheapestInstrs = 0;
+  uint64_t plannedCycles = 0, fastestCycles = 0;
   SmallVector<Attribute> tileReport;
 
 private:
   func::FuncOp func;
   OpBuilder b;
   int64_t spmReserve;
+  int64_t imemBudget;
   int64_t layerId = 0;
   /// Occurrence count per requested buffer name, for uniquification.
   llvm::StringMap<unsigned> bufferNameCount;
   DenseMap<Value, Value> dramFor; // Level 1 tensor -> DRAM !kea.buffer
+
+  /// Filled by plan(), consumed by the lowering. `candidates` is every layer's
+  /// Pareto frontier of (instructions, cycles); `chosen` is the point on it
+  /// that solveTilingBudget() picked. Both keyed by the Level 1 op.
+  DenseMap<Operation *, Candidates> candidates;
+  DenseMap<Operation *, ConvTiling> chosen;
 
   /// Count of LOAD_W/MATMUL pairs emitted so far, monotonic over the whole
   /// function. `bank = mxuPairs & 1` is ISA.md §8.3's `t & 1`, but with `t`
@@ -570,6 +815,10 @@ private:
     return v;
   }
 
+  //--- planning ------------------------------------------------------------
+  void plan(ArrayRef<Operation *> l1);
+  LogicalResult solveTilingBudget(ArrayRef<Operation *> l1);
+
   //--- lowering entry points ----------------------------------------------
   LogicalResult lower(Operation *op);
   LogicalResult lowerContraction(Operation *op, ConvShape s, Value inTensor,
@@ -594,6 +843,137 @@ private:
                         StringRef name);
   void emitFill(Location loc, Value tile, int64_t bytes, int64_t zp);
 };
+
+//===----------------------------------------------------------------------===//
+// Planning: choosing tile sizes for the whole function at once
+//===----------------------------------------------------------------------===//
+
+// Defined with the lowering, below, so the shape a layer is COSTED with is
+// textually next to the shape it is EMITTED with and the two cannot drift.
+static std::optional<ConvShape> convShapeFor(Operation *op);
+static bool hasResidualEpilogue(Operation *op);
+
+void Tiler::plan(ArrayRef<Operation *> l1) {
+  for (Operation *op : l1) {
+    if (auto sh = convShapeFor(op)) {
+      Candidates c =
+          enumerateConvTilings(*sh, spmReserve, hasResidualEpilogue(op));
+      if (!c.empty())
+        candidates[op] = std::move(c);
+      continue;
+    }
+    if (auto dw = dyn_cast<DWConv2DOp>(op)) {
+      DwShape d;
+      if (dwShapeFor(dw, d)) {
+        Candidates c = enumerateDwTilings(d, spmReserve);
+        if (!c.empty())
+          candidates[op] = std::move(c);
+      }
+    }
+    // Pooling and elementwise add contribute a handful of instructions each and
+    // have no tile/cycle trade-off worth pricing; they are counted as fixed
+    // overhead by the headroom in `imemBudget`.
+  }
+}
+
+/// Choose one tiling per layer, minimising total estimated cycles subject to a
+/// whole-function instruction budget.
+///
+/// This is a separable resource-allocation problem: layers are independent, so
+/// the classic Lagrangian relaxation applies. For a price `lambda` in cycles
+/// per instruction, each layer independently takes
+/// `argmin(cycles + lambda * instructions)`; raising the price monotonically
+/// trades cycles for program size. Bisect on `lambda` for the cheapest price
+/// that fits.
+///
+/// Why not a per-layer rule of thumb: IMEM is a *global* budget, and the
+/// exchange rate between cycles and instructions is wildly different across a
+/// network. On MobileNetV2 the early 112x112 layers buy a large number of
+/// instructions back for very few cycles (their tiles are DMA bound, so a
+/// coarser tile costs almost nothing), while the late 7x7 layers are weight
+/// bound and a coarser tile costs real time. A single price applied to every
+/// layer's own frontier is exactly the mechanism that spends the budget where
+/// it is cheapest, and it needs no per-layer tuning.
+LogicalResult Tiler::solveTilingBudget(ArrayRef<Operation *> l1) {
+  SmallVector<const Candidates *> sets;
+  for (Operation *op : l1) {
+    auto it = candidates.find(op);
+    if (it != candidates.end())
+      sets.push_back(&it->second);
+  }
+
+  // The frontier is sorted by ascending instructions, so front() is the
+  // smallest program and back() is the fastest.
+  auto totalAt = [&](double lambda, int64_t &instrs, uint64_t &cycles) {
+    instrs = 0;
+    cycles = 0;
+    for (const Candidates *c : sets) {
+      const ConvTiling &t = pickUnderPrice(*c, lambda);
+      instrs += t.instrs;
+      cycles += t.cycles;
+    }
+  };
+
+  int64_t smallest = 0;
+  uint64_t fastest = 0;
+  for (const Candidates *c : sets) {
+    smallest += c->front().instrs;
+    fastest += c->back().cycles;
+  }
+  cheapestInstrs = smallest;
+  fastestCycles = fastest;
+
+  double lambda = 0.0;
+  totalAt(0.0, plannedInstrs, plannedCycles);
+
+  if (plannedInstrs > imemBudget) {
+    if (smallest > imemBudget)
+      return func.emitOpError()
+             << "cannot fit this function in the instruction budget: even the "
+                "coarsest tiling of every layer needs " << smallest
+             << " instructions against a budget of " << imemBudget
+             << ". KEA-1 is branchless, so program size is a hard capacity "
+                "limit (IMEM holds " << ::kea::KEA_MAX_INSTRUCTIONS
+             << " instructions and is not paged) -- split the model across "
+                "invocations, or raise -kea-tile=imem-budget if the headroom "
+                "reserved for -kea-schedule's SIGNAL/WAIT pairs is too "
+                "generous.";
+
+    // Bisect for the smallest price that fits. The upper bound only has to be
+    // large enough that every layer takes its smallest tiling; cycle estimates
+    // are bounded by the whole-network cycle count, so any price above that
+    // dominates every cycle difference.
+    double lo = 0.0, hi = 1.0;
+    int64_t hiInstrs = 0;
+    uint64_t hiCycles = 0;
+    for (int i = 0; i < 64; ++i) {
+      totalAt(hi, hiInstrs, hiCycles);
+      if (hiInstrs <= imemBudget)
+        break;
+      hi *= 4.0;
+    }
+    for (int i = 0; i < 60; ++i) {
+      double mid = 0.5 * (lo + hi);
+      int64_t ins = 0;
+      uint64_t cyc = 0;
+      totalAt(mid, ins, cyc);
+      if (ins <= imemBudget)
+        hi = mid;
+      else
+        lo = mid;
+    }
+    lambda = hi;
+    totalAt(lambda, plannedInstrs, plannedCycles);
+  }
+
+  budgetPrice = lambda;
+  for (Operation *op : l1) {
+    auto it = candidates.find(op);
+    if (it != candidates.end())
+      chosen[op] = pickUnderPrice(it->second, lambda);
+  }
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // Constraint discharge
@@ -763,7 +1143,10 @@ LogicalResult Tiler::lowerContraction(Operation *op, ConvShape s,
       failed(buildAddParam(op, epi.accum, epi.residual, epi.output, addParam)))
     return failure();
 
-  auto tOpt = chooseConvTiling(s, spmReserve);
+  auto cIt = chosen.find(op);
+  std::optional<ConvTiling> tOpt;
+  if (cIt != chosen.end())
+    tOpt = cIt->second;
   if (!tOpt)
     return op->emitOpError()
            << "no output tile fits the scratchpad: even a 1x1 output tile of "
@@ -1078,44 +1461,16 @@ LogicalResult Tiler::lowerDwconv(DWConv2DOp op) {
   // no channel tiling -- DWCONV iterates channel groups internally for the same
   // cycle count in one instruction (ISA.md §9.1).
   const int64_t spmABudget = kSpmABytes / spmReserve;
-  std::optional<std::pair<int64_t, int64_t>> best;
-  int64_t bestIn = 0, bestOut = 0, bestAcc = 0;
-  uint64_t bestCycles = ~uint64_t(0);
-  for (int64_t ohT : divisorsOf(OH)) {
-    if (ohT > kDmaMaxN2)
-      break;
-    for (int64_t owT : divisorsOf(OW)) {
-      const int64_t ihP = (ohT - 1) * S + KH;
-      const int64_t iwP = (owT - 1) * S + KW;
-      const int64_t inBytes = ihP * iwP * cPad + kDwuLanes;
-      const int64_t outBytes = ohT * owT * cPad + kDwuLanes;
-      const int64_t accWords = ohT * owT * cPad;
-      if (accWords > kAccWords / spmReserve || inBytes + outBytes > spmABudget)
-        continue;
-      if (iwP * cPad > kDmaMaxLen0 || ihP > kDmaMaxN1)
-        continue;
-      uint64_t cyc = std::max(
-          ::kea::keaDwconvOccupancy(ohT, owT, cPad, KH, KW),
-          std::max(::kea::keaVquantOccupancy(ohT * owT, cPad),
-                   ::kea::keaDmaOccupancy(iwP * C, ihP, 1) +
-                       ::kea::keaDmaOccupancy(C, owT, ohT)));
-      cyc *= static_cast<uint64_t>((OH / ohT) * (OW / owT));
-      if (cyc < bestCycles ||
-          (cyc == bestCycles && ohT * owT > best->first * best->second)) {
-        bestCycles = cyc;
-        best = {ohT, owT};
-        bestIn = inBytes;
-        bestOut = outBytes;
-        bestAcc = accWords;
-      }
-    }
-  }
-  if (!best)
+  auto cIt = chosen.find(op.getOperation());
+  if (cIt == chosen.end())
     return op.emitOpError()
            << "no output tile fits: a 1x1 depthwise tile of " << cPad
            << " channels already needs " << (KH * KW * cPad)
            << " B of SPM_A budget " << spmABudget;
-  const int64_t ohT = best->first, owT = best->second;
+  const ConvTiling dt = cIt->second;
+  const int64_t ohT = dt.ohT, owT = dt.owT;
+  const int64_t bestIn = dt.inBytes, bestOut = dt.outBytes;
+  const int64_t bestAcc = dt.accWords;
   const int64_t ihP = (ohT - 1) * S + KH, iwP = (owT - 1) * S + KW;
   const int64_t sp = cPad, sr = iwP * cPad;
 
@@ -1381,6 +1736,86 @@ LogicalResult Tiler::lowerAdd(AddOp op) {
 // Dispatch
 //===----------------------------------------------------------------------===//
 
+/// The `ConvShape` of a contraction, or nullopt when the op is not one (or not
+/// one this pass lowers). Shared by the planning pass and `lower()` so the
+/// tiling a layer is costed with is exactly the tiling it is emitted with.
+static std::optional<ConvShape> convShapeFor(Operation *op) {
+  if (auto conv = dyn_cast<Conv2DOp>(op)) {
+    auto in = shapeOf(conv.getInput());
+    auto w = shapeOf(conv.getWeights());
+    auto out = shapeOf(conv.getOutput());
+    if (in.size() != 4 || out.size() != 4 || w.size() != 4 || in[0] != 1)
+      return std::nullopt;
+    ConvShape s;
+    s.IH = in[1];
+    s.IW = in[2];
+    s.IC = in[3];
+    s.OH = out[1];
+    s.OW = out[2];
+    s.OC = out[3];
+    s.KH = w[1];
+    s.KW = w[2];
+    auto st = conv.getStrides(), dl = conv.getDilations(), pd = conv.getPads();
+    s.strideH = st[0];
+    s.strideW = st[1];
+    s.dilH = dl[0];
+    s.dilW = dl[1];
+    s.padTop = pd[0];
+    s.padLeft = pd[2];
+    s.inputZp = conv.getZeroPoints().getInput();
+    s.channelPacked =
+        s.KW > 1 && s.dilW == 1 && s.IC < kMxuK && s.KW * s.IC <= kMxuK;
+    return s;
+  }
+  if (auto fc = dyn_cast<FullyConnectedOp>(op)) {
+    auto in = shapeOf(fc.getInput());
+    auto w = shapeOf(fc.getWeights());
+    if (in.size() != 2 || w.size() != 2)
+      return std::nullopt;
+    ConvShape s;
+    s.IH = 1;
+    s.IW = in[0];
+    s.IC = in[1];
+    s.OH = 1;
+    s.OW = in[0];
+    s.OC = w[0];
+    s.inputZp = fc.getZeroPoints().getInput();
+    return s;
+  }
+  if (auto mm = dyn_cast<MatmulOp>(op)) {
+    auto a = shapeOf(mm.getA());
+    auto w = shapeOf(mm.getB());
+    if (a.size() != 3 || w.size() != 3)
+      return std::nullopt;
+    ConvShape s;
+    s.batch = a[0];
+    s.IH = 1;
+    s.IW = a[1];
+    s.IC = a[2];
+    s.OH = 1;
+    s.OW = a[1];
+    s.OC = w[2];
+    s.inputZp = mm.getZeroPoints().getInput();
+    return s;
+  }
+  return std::nullopt;
+}
+
+/// True when the op's fused epilogue carries the residual triple, which costs
+/// three extra instructions per tile.
+static bool hasResidualEpilogue(Operation *op) {
+  auto e = [&]() -> std::optional<EpilogueAttr> {
+    if (auto c = dyn_cast<Conv2DOp>(op))
+      return c.getEpilogue();
+    if (auto f = dyn_cast<FullyConnectedOp>(op))
+      return f.getEpilogue();
+    if (auto m = dyn_cast<MatmulOp>(op))
+      return m.getEpilogue();
+    return std::nullopt;
+  }();
+  return e && (*e).getAccum() && (*e).getResidual() && (*e).getOutput();
+}
+
 LogicalResult Tiler::lower(Operation *op) {
   if (auto conv = dyn_cast<Conv2DOp>(op)) {
     auto in = shapeOf(conv.getInput());
@@ -1447,6 +1882,25 @@ LogicalResult Tiler::lower(Operation *op) {
     auto w = shapeOf(mm.getB()); // [B, K, N]
     if (a.size() != 3 || w.size() != 3)
       return mm.emitOpError("expects rank-3 operands");
+    // The right-hand side becomes a `role = "weights"` DRAM buffer that
+    // `-kea-emit` materializes from the constant blob in `mxu_tiles_16x16_kn`
+    // layout, so it has to BE a constant. When it is an activation -- the
+    // attention pattern, Q.K^T and P.V -- there is nothing to materialize.
+    // Refuse with an explanation rather than building an unresolvable buffer.
+    {
+      DenseElementsAttr rhs;
+      if (!matchPattern(mm.getB(), m_Constant(&rhs)))
+        return mm.emitOpError(
+            "cannot lower a matmul whose right-hand side is an activation "
+            "rather than a compile-time constant. The MXU is weight "
+            "stationary: -kea-tile turns the second operand into a DRAM "
+            "weight blob that -kea-emit lays out as 16x16 tiles, and an "
+            "activation is not in that blob. Lowering this needs a second "
+            "weight path -- DMA the [K, N] activation densely into SPM_W and "
+            "LOAD_W it in place with w_row_stride = N, which is legal "
+            "whenever N is a multiple of 16 -- and that path is not "
+            "implemented. This blocks attention (Q.K^T and P.V).");
+    }
     ConvShape s;
     s.batch = a[0];
     s.IH = 1;
@@ -1516,6 +1970,13 @@ LogicalResult Tiler::run() {
     return verifyWeightBanks(func);
   }
 
+  // Choose every layer's tiling BEFORE emitting any of them. Program size is a
+  // whole-function budget (see solveTilingBudget), so it cannot be respected by
+  // a per-layer greedy choice made while walking.
+  plan(l1);
+  if (failed(solveTilingBudget(l1)))
+    return failure();
+
   b.setInsertionPoint(body.getTerminator());
   for (Operation *op : l1) {
     if (failed(lower(op)))
@@ -1544,8 +2005,21 @@ LogicalResult Tiler::run() {
   func.setType(b.getFunctionType(body.getArgumentTypes(), {}));
 
   // Erase the Level 1 ops, then anything that became dead.
+  //
+  // NOT `dropAllUses()`. That silently rewrites every surviving reference to a
+  // Level 1 result into a null operand, which is how a lowering that wrongly
+  // kept a Level 1 value alive -- a `kea.alloc` sourced from an activation,
+  // say -- surfaced as an unattributable "null operand found" from the
+  // verifier instead of a diagnostic on the op that could not be lowered.
+  // Reverse order plus the rewritten terminator means every use is already
+  // gone in a correct lowering, so a survivor is a bug in THIS pass and should
+  // say so.
   for (Operation *op : llvm::reverse(l1)) {
-    op->dropAllUses();
+    if (!op->use_empty())
+      return op->emitOpError(
+          "internal error in -kea-tile: this Level 1 op was lowered but "
+          "something still refers to its result, so erasing it would leave a "
+          "dangling operand. Please report this with the input IR.");
     op->erase();
   }
   bool changed = true;
@@ -1565,16 +2039,33 @@ LogicalResult Tiler::run() {
   // not paged. -kea-schedule will add SIGNAL/WAIT on top of this, so hitting
   // the limit here means the layer needs bigger tiles or the model needs to be
   // split across invocations.
+  // Count KEA-1 instructions, i.e. every `kea` op except `kea.alloc`, which is
+  // a buffer identity rather than an instruction. (This compared against
+  // `func->getDialect()` before, which is the `func` dialect, so it only ever
+  // counted the terminator and the IMEM guard below could never fire.)
   int64_t instrs = 0;
   for (Operation &op : body)
-    if (op.getDialect() == func->getDialect() && !isa<AllocOp>(op))
+    if (op.getName().getDialectNamespace() == KeaDialect::getDialectNamespace() &&
+        !isa<AllocOp>(op))
       ++instrs;
+  emittedInstrs = instrs;
   if (instrs > static_cast<int64_t>(::kea::KEA_MAX_INSTRUCTIONS))
     return func.emitOpError()
            << "lowers to " << instrs
            << " KEA-1 instructions, more than IMEM holds ("
            << ::kea::KEA_MAX_INSTRUCTIONS
            << "), and -kea-schedule still has to add its SIGNAL/WAIT pairs";
+  // The planner's instruction model is what the budget was spent against, so
+  // it has to be a count and not an estimate. It may only UNDERstate the
+  // total, by exactly the ops it does not model -- pooling, elementwise add,
+  // HALT -- which are additive and independent of tiling. Overstating would
+  // mean the budget bought less than it was charged for.
+  if (plannedInstrs > instrs)
+    return func.emitOpError()
+           << "internal error in -kea-tile: the instruction model predicted "
+           << plannedInstrs << " instructions but the lowering emitted "
+           << instrs << ". The IMEM budget is spent against that model, so it "
+              "must not overcount. Please report this with the input IR.";
 
   refreshLiveRanges(func);
   return verifyWeightBanks(func); // errata E7
@@ -1593,7 +2084,11 @@ struct KeaTilePass : public mlir::kea::impl::KeaTileBase<KeaTilePass> {
       func.emitError("spm-reserve-factor must be >= 1");
       return signalPassFailure();
     }
-    Tiler tiler(func, spmReserveFactor);
+    if (imemBudget < 1) {
+      func.emitError("imem-budget must be >= 1");
+      return signalPassFailure();
+    }
+    Tiler tiler(func, spmReserveFactor, imemBudget);
     if (failed(tiler.run()))
       return signalPassFailure();
 
@@ -1604,6 +2099,27 @@ struct KeaTilePass : public mlir::kea::impl::KeaTileBase<KeaTilePass> {
     if (reportTiles && !tiler.tileReport.empty()) {
       OpBuilder b(func.getContext());
       func->setAttr("kea.tiling", b.getArrayAttr(tiler.tileReport));
+      // What the whole-function budget cost. `price` is the Lagrangian
+      // multiplier in cycles per instruction: 0 means the cycle-optimal tiling
+      // of every layer already fit and nothing was traded away.
+      func->setAttr(
+          "kea.imem",
+          b.getDictionaryAttr({
+              b.getNamedAttr("budget", b.getI64IntegerAttr(imemBudget)),
+              b.getNamedAttr("emitted",
+                             b.getI64IntegerAttr(tiler.emittedInstrs)),
+              b.getNamedAttr("planned",
+                             b.getI64IntegerAttr(tiler.plannedInstrs)),
+              b.getNamedAttr("smallest",
+                             b.getI64IntegerAttr(tiler.cheapestInstrs)),
+              b.getNamedAttr("cycles",
+                             b.getI64IntegerAttr((int64_t)tiler.plannedCycles)),
+              b.getNamedAttr(
+                  "cycles_unconstrained",
+                  b.getI64IntegerAttr((int64_t)tiler.fastestCycles)),
+              b.getNamedAttr("price",
+                             b.getF64FloatAttr(tiler.budgetPrice)),
+          }));
     }
   }
 };

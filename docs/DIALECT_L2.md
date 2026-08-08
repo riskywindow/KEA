@@ -424,9 +424,10 @@ Per spatial tile, on each of the three concurrent resources:
 MXU = ocg * icTiles * taps * keaMatmulOccupancy(OW_t, OH_t, int4)
     + keaLoadWOccupancy(k_rows, int4)
 VPU = ocg * keaVquantOccupancy(OH_t*OW_t, 16)
-    + keaVcopyOccupancy(IW_p*IC, IH_p)                  [when there is a halo]
-DMA = keaDmaOccupancy(IW_p*IC, IH_p, 1)                 [activations in]
-    + keaDmaOccupancy(OCG_t*16, OW_t, OH_t)             [activations out]
+    + keaVcopyOccupancy(halo)
+DMA = keaDmaOccupancy(IW_p*IC, IH_p, 1)          [activations in]
+    + keaDmaOccupancy(OCG_t*16, OW_t, OH_t)      [activations out]
+sync = KEA_MXU_PIPELINE_DEPTH + KEA_VPU_PIPELINE_DEPTH   (DWU depth for a depthwise)
 ```
 
 Only **one** `LOAD_W` is charged per tile, not one per tap: consecutive pairs
@@ -435,66 +436,179 @@ previous `MATMUL` (ISA.md §7.1). That is not an optimistic assumption, it is
 what the bank alternation rule in §6.1 is *for* — and that rule has to be the
 monotonic one for the assumption to hold at output-channel group boundaries.
 
-The three resources run concurrently and `-kea-schedule` overlaps them, so the
-tile's cost is the **max**, not the sum:
+`sync` is the part that overlaps with nothing. Every tile boundary is a
+cross-unit hand-off, and ISA.md §5.3 is explicit that a `SIGNAL` costs the
+issuing unit's pipeline depth because it is a local drain barrier. Without a
+per-tile floor the model sees no cost at all in doubling the tile count, since
+halving a tile halves every other term.
+
+**Whether the three resources overlap is itself part of the cost.** A tile that
+occupies more than half of a scratchpad cannot have its successor prefetched
+into the other half, so its DMA cannot hide under its compute:
 
 ```
-total = nOcTiles * ( weightDMA + nSpatialTiles * batch * max(MXU, VPU, DMA) )
+doubleBufferable = 2*(inBytes + outBytes) <= KEA_SPM_A_BYTES
+                && 2*accWords             <= KEA_ACC_WORDS
+                && 2*(wBytes + qpBytes)   <= KEA_SPM_W_BYTES
+
+tile = sync + (doubleBufferable ? max(MXU, VPU, DMA) : MXU + VPU + DMA)
+total = nOcTiles * (weightDMA + nSpatialTiles * batch * tile)
 ```
 
-Minimize `total`; break ties toward the larger tile (fewer instructions, less
-dispatch pressure). If no candidate is feasible, `-kea-tile` fails with a
-diagnostic naming which capacity was exceeded — it never silently produces
-something that will not fit.
+This is the one place the cost model reaches into `-kea-schedule`'s job, and it
+has to. Pricing every tile at `max()` would tell the search a tile twice as
+large is free, which is exactly wrong; pricing every tile at the sum would give
+up the overlap the two DMA engines exist for (ISA.md §12).
 
-The model is deliberately *scheduling-aware while emitting an unscheduled
-program*. Costing tiles as `MXU + VPU + DMA` would systematically prefer tiles
-that are too small, because it would price overlap that the next pass is
-guaranteed to deliver.
+It also makes `spm-reserve-factor` largely redundant, which is why it now
+defaults to **1**. The factor was a blunt proxy for "leave room to double
+buffer": divide every capacity and hope. With overlap priced directly the
+search discovers the same answer on its own — on MobileNetV2's feature
+extractor, tiling at reserve 1 with this model picks *exactly* the plan that
+reserve 2 forced (25,642 instructions, unconstrained) — but it can also choose
+a bigger, non-overlapped tile for a layer where that is genuinely cheaper. The
+factor remains as a hard cap for anyone who wants to impose one.
 
-**Depthwise** (`kea.dwconv2d`) uses the same shape of search over `(OH_t, OW_t)`
-with `keaDwconvOccupancy` in place of the MXU term. There is no channel tiling:
-`DWCONV` iterates channel groups internally for the same cycle count in one
-instruction (ISA.md §9.1), so splitting channels would only add instructions.
+### 5.3.1 The instruction budget
 
-**Pooling** tiles over output row bands only; **`kea.add`** splits the flat
-element range into chunks of `SPM_A / (3R)`, three tiles being live at once.
+KEA-1 is branchless (ISA.md §1). Every tile of every layer is written out as
+straight-line code, so **halving a tile doubles that layer's contribution to
+program size**, and IMEM holds `KEA_MAX_INSTRUCTIONS` = 32768 instructions and
+is not paged. Program size is therefore a capacity constraint exactly like
+SPM_A or ACC — except that it is *global*, so no per-layer greedy choice can
+respect it. Choosing each layer's cycle-optimal tile overruns IMEM on
+MobileNetV2's feature extractor by 26%.
+
+So each layer publishes its whole **Pareto frontier** of (instructions,
+cycles), and one whole-function pass chooses across all of them:
+
+```
+instrs = 2                                     TRACE begin/end
+       + batch * ( nOcTiles * (2 + residual)             weight/qparam/addparam DMA
+                 + residualPadFills
+                 + nSpatial * ( nOcTiles * (3 + 2*residual)   fill, load, store [, residual load+add]
+                              + ocGroups * (2*icTiles*taps + 1) ) )   LOAD_W+MATMUL pairs, VQUANT
+```
+
+That is a count, not an estimate: every term is a `b.create<...>` in
+`lowerContraction`, and `run()` fails loudly if the model ever *over*counts,
+because the budget is spent against it. It undercounts by exactly the ops it
+does not model — pooling, elementwise add, `kea.halt` — which are additive and
+independent of tiling.
+
+The selection is a **Lagrangian relaxation**, which is exact for a separable
+resource allocation like this one. For a price `lambda` in cycles per
+instruction, each layer independently takes `argmin(cycles + lambda*instrs)`;
+raising the price monotonically trades cycles for program size. `-kea-tile`
+bisects for the cheapest price that fits `imem-budget`, and reports the result
+in `kea.imem`:
+
+```mlir
+kea.imem = {budget = 20480, planned = 20419, emitted = 20420, smallest = 19066,
+            cycles = 2578535, cycles_unconstrained = 2004382, price = 393.1}
+```
+
+`price = 0` means the cycle-optimal plan already fit and nothing was traded
+away — which is the case for every layer-sized test in `compiler/test`.
+
+A single price applied to each layer's own frontier is what spends the budget
+where it is cheapest, with no per-layer tuning. That matters because the
+exchange rate is wildly different across a network: the early 112x112 layers
+are DMA bound, so a coarser tile there costs almost nothing and buys back a
+large number of instructions, while the late 7x7 layers are weight bound and a
+coarser tile costs real time.
+
+**`imem-budget` defaults to 20480**, i.e. five eighths of IMEM. The missing
+three eighths are headroom for the `SIGNAL`/`WAIT` pairs `-kea-schedule` and
+`kea-translate` add afterwards, measured at 44-61% of the tiled program on
+MobileNetV2 (§5.5). `-kea-tile` cannot count those itself — it deliberately
+emits no synchronization at all (§4.6) — so the headroom is a measured
+constant rather than a model.
 
 ### 5.4 What it picks for MobileNetV2
 
-Run `-kea-tile=report-tiles=true` and read `kea.tiling` off the function. For
-MobileNetV2 1.0/224 at the default `spm-reserve-factor=2` (so the budget is
-131072 B of SPM_A, 131072 B of SPM_W, 32768 ACC words):
+Run `-kea-tile=report-tiles=true` and read `kea.tiling` off the function. At
+the defaults (`spm-reserve-factor=1`, `imem-budget=20480`), for MobileNetV2
+1.0/224 with the cycle-optimal plan unconstrained (`imem-budget` large):
 
-| layer | shape | `OH_t × OW_t` | `OCG_t` | SPM_A | SPM_W | ACC | est. cycles |
+| layer | shape | `OH_t x OW_t` | `OCG_t` | SPM_A | SPM_W | ACC | est. cycles |
 |---|---|---|---|---|---|---|---|
-| conv 3×3 s2, 3→32, 112² out | packed (§8.6) | 8 × 112 | 2 | 40,179 | 1,920 | 28,672 | 75,854 |
-| dw 3×3 s1, 112²×32 | | 16 × 56 | — | 62,112 | 672 | 28,672 | |
-| pw 32→16, 112² | | 16 × 112 | 1 | 86,048 | 704 | 28,672 | 63,248 |
-| pw 16→96, 112² | | 2 × 112 | 6 | 25,120 | 2,688 | 21,504 | 115,116 |
-| dw 3×3 s2, 112²×96 | | 14 × 14 | — | 99,584 | 2,016 | 18,816 | |
-| pw 96→24, 56² | | 14 × 56 | 2 | 100,384 | 3,456 | 25,088 | 38,116 |
-| dw 3×3 s1, 56²×144 | | 14 × 14 | — | 65,120 | 3,024 | 28,224 | |
-| pw 384→96, 14² | | 14 × 14 | 6 | 94,112 | 38,016 | 18,816 | 31,222 |
-| pw 960→320, 7² | | 7 × 7 | 5 | 50,992 | 77,760 | 3,920 | 83,224 |
-| pw 320→1280, 7² | | 7 × 7 | 20 | 31,392 | 106,240 | 15,680 | 111,544 |
-| avgpool 7×7×1280 | | 1 × 1 | — | 64,000 | — | — | |
-| FC 1280→1000 | | 1 × 1 | 3 | 1,360 | 62,016 | 48 | 107,562 |
+| conv 3x3 s2, 3->32, 112^2 out | packed (§8.6) | 8 x 112 | 2 | 40,179 | 1,920 | 28,672 | 75,854 |
+| dw 3x3 s1, 112^2 x 32 | | 16 x 56 | — | 62,112 | 672 | 28,672 | |
+| pw 32->16, 112^2 | | 16 x 112 | 1 | 86,048 | 704 | 28,672 | 63,248 |
+| pw 16->96, 112^2 | | 2 x 112 | 6 | 25,120 | 2,688 | 21,504 | 115,116 |
+| dw 3x3 s2, 112^2 x 96 | | 14 x 14 | — | 99,584 | 2,016 | 18,816 | |
+| pw 96->24, 56^2 | | 14 x 56 | 2 | 100,384 | 3,456 | 25,088 | 38,116 |
+| dw 3x3 s1, 56^2 x 144 | | 14 x 14 | — | 65,120 | 3,024 | 28,224 | |
+| pw 384->96, 14^2 | | 14 x 14 | 6 | 94,112 | 38,016 | 18,816 | 31,222 |
+| pw 960->320, 7^2 | | 7 x 7 | 5 | 50,992 | 77,760 | 3,920 | 83,224 |
+| pw 320->1280, 7^2 | | 7 x 7 | 20 | 31,392 | 106,240 | 15,680 | 111,544 |
+| avgpool 7x7x1280 | | 1 x 1 | — | 64,000 | — | — | |
+| FC 1280->1000 | | 1 x 1 | 3 | 1,360 | 62,016 | 48 | 107,562 |
 
 Three things are worth reading off that table:
 
-* **The 112²×32 layers are row bands**, exactly as MICROARCH.md §9.3(b)
-  predicted: `112·112·32 = 401,408` bytes does not fit in a 256 KiB SPM_A, so
-  the tiler picks 8- or 16-row bands.
-* **The late 7×7 layers tile over output channels instead** (`OCG_t` 5 and 20 of
-  20 and 80 groups): there the activations are tiny and the *weights* are what
-  does not fit, so the loop that gets split is the channel loop.
+* **The 112^2 x 32 layers are row bands**, exactly as MICROARCH.md §9.3(b)
+  predicted: `112*112*32 = 401,408` bytes does not fit in a 256 KiB SPM_A.
+* **The late 7x7 layers tile over output channels instead** (`OCG_t` 5 and 20
+  of 20 and 80 groups): there the activations are tiny and the *weights* are
+  what does not fit, so the loop that gets split is the channel loop.
 * **The classifier's estimate, 107,562 cycles, is DMA bound and matches
-  MICROARCH.md §9.3(d)** — 80,080 cycles of weight streaming plus ~25,200 cycles
-  of `MATMUL` setup on a batch-1 `m_inner = 1` GEMM. The model reproduces the
-  hand analysis without being told about it.
+  MICROARCH.md §9.3(d)** — 80,080 cycles of weight streaming plus ~25,200
+  cycles of `MATMUL` setup on a batch-1 `m_inner = 1` GEMM. The model
+  reproduces the hand analysis without being told about it.
 
----
+Under the default budget the plan is coarser than this: the whole feature
+extractor is planned at 20,419 instructions instead of 25,642, at an estimated
+2,578,535 cycles instead of 2,004,382.
+
+### 5.5 The measured instruction/cycle trade-off
+
+MobileNetV2's 179-node feature extractor (all 52 convolutions, 224x224), taken
+all the way to a `.keaf` and simulated. "tiled" is what `-kea-tile` emits;
+".kasm" is after `kea-translate --sync=auto` inserts synchronization; cycles are
+`kea-sim` totals with `--kea-schedule`.
+
+| `spm-reserve` | `imem-budget` | tiled | .kasm | fits IMEM | cycles |
+|---|---|---|---|---|---|
+| 1 | (none — old behaviour) | 21,417 | 30,773 | yes | 3,235,612 |
+| 2 | (none — old default) | 25,642 | 41,409 | **no, +26%** | — |
+| 1 | 21,000 | 20,801 | 31,648 | yes | 3,179,147 |
+| **1** | **20,480 (new default)** | **20,419** | **30,430** | **yes** | **3,176,061** |
+| 1 | 20,400 | 20,353 | 30,144 | yes | 3,145,547 |
+| 1 | 20,000 | 19,909 | 28,634 | yes | **3,133,342** |
+| 1 | 19,600 | 19,589 | 26,212 | yes | 3,684,501 |
+| 1 | 19,200 | 19,159 | 26,336 | yes | 4,002,032 |
+| 1 | <= 19,000 | — | — | — | infeasible: the coarsest plan is 19,066 |
+| 2 | 21,000 | 20,785 | 31,816 | yes | 3,217,107 |
+
+Read it in three parts.
+
+**The default now fits with no flags.** Before this work the only configuration
+that fitted IMEM was `--spm-reserve 1` with no instruction budget, and the demo
+was pinned to it. It now fits at the defaults and is 1.019x faster as well.
+
+**The curve is not monotonic, and its optimum is not where the cost model
+thinks it is.** Coarsening from 20,480 down to 20,000 instructions makes the
+program *faster* (3,176,061 -> 3,133,342) even though the tiler's own estimate
+says the opposite, and then coarsening further falls off a cliff. The tiler
+prices a tile in isolation; it cannot see dispatcher stalls on full queues, or
+how many `SIGNAL`/`WAIT` pairs the downstream passes will insert, or how well
+they will overlap. `imem-budget` exists partly so that measured optimum can be
+selected rather than argued about — for this network, `20000` is worth a
+further 1.3%.
+
+**Scheduling and program size pull against each other, and program size wins
+here.** `-kea-schedule` is worth 1.181x at the default budget (3,727,589
+unscheduled vs 3,176,061 scheduled). It was measured at 1.484x on the first 98
+nodes at `--spm-reserve 2` — but that is a prefix that fits IMEM without
+squeezing, and the full feature extractor at reserve 2 does not: its coarsest
+plan is already 20,765 tiled instructions, and the tiles that coarse cost more
+than the overlap buys (3,217,107, worse than reserve 1 at the same budget).
+The honest summary is that on the *whole* feature extractor the reserve factor
+is worth much less than 1.484x once IMEM is respected, and that the largest
+remaining lever is not tile size but the 44-61% of the program that
+synchronization occupies.
 
 ## 6. The convolution lowering (ISA.md §8.5, normative)
 
@@ -769,13 +883,22 @@ hand-written IR — that is how `@e7_unwritten_weight_bank` is tested.
 
 ```bash
 kea-opt in.mlir -kea-tile
-kea-opt in.mlir -kea-tile=spm-reserve-factor=1     # spend the whole scratchpad
-kea-opt in.mlir -kea-tile=report-tiles=true        # publish kea.tiling
+kea-opt in.mlir "-kea-tile=imem-budget=20000 report-tiles=true"
+kea-opt in.mlir -kea-tile=spm-reserve-factor=2     # cap every tile at half a scratchpad
 ```
 
-`spm-reserve-factor` divides each scratchpad's capacity before tiling; the
-default 2 leaves `-kea-schedule` room for a second set of tiles. `1` produces
-the largest tiles and a program that cannot be double buffered.
+(Several options need one `-kea-tile=` and spaces between them, which the shell
+requires you to quote.)
+
+`imem-budget` is the whole-function instruction budget the planner spends,
+default 20480 — see §5.3.1. Raise it if you are not going to run
+`-kea-schedule` or `kea-translate --sync`; lower it to trade cycles for program
+size, which on MobileNetV2 is worth doing (§5.5).
+
+`spm-reserve-factor` divides each scratchpad's capacity before tiling. It now
+defaults to **1**, because the cost model prices double-buffering directly
+(§5.3) instead of proxying it with a divisor. Setting it to 2 restores the old
+behaviour of forcing every tile to half a scratchpad.
 
 `report-tiles` attaches a `kea.tiling` array to the function: one dictionary per
 lowered layer with the chosen tile, the SPM_A / SPM_W / ACC footprint, the
@@ -806,6 +929,21 @@ Stated plainly rather than stubbed:
   never emits it — nothing upstream produces an int4 Level 1 graph yet.
 * **Batch > 1** for `kea.conv2d` and `kea.dwconv2d`. `kea.matmul` loops its
   batch dimension; the convolutions reject `N != 1` rather than pretending.
+* **`kea.matmul` with a non-constant right-hand side** — activation-by-
+  activation matmul, i.e. attention's `Q.K^T` and `P.V`. The MXU is weight
+  stationary and `-kea-tile` turns the second operand into a `role = "weights"`
+  DRAM buffer that `-kea-emit` materializes from the constant blob, so an
+  activation has nothing to materialize. Refused with a diagnostic naming the
+  op; it blocks all 12 matmuls in the tiny ViT.
+
+  It is lowerable and the path is short: DMA the `[K, N]` activation densely
+  into SPM_W and `LOAD_W` it *in place* with `w_row_stride = N`, which ISA.md
+  §7.2 permits for any stride that is a multiple of 16 — so no re-layout and no
+  transpose unit is needed whenever `N % 16 == 0`. Beyond that it needs a
+  second weight-buffer role (so `-kea-emit` does not look for it in the blob),
+  a SPM_W budget term for a `K*N` activation, and the worst-case accumulator
+  bound instead of the weight-derived one (§7.2), since the values are not
+  known at compile time.
 * **`kea.transpose`, standalone `kea.rescale`, standalone `kea.clamp`.** KEA-1
   has no transpose unit (ISA.md §13) and no way to requantize a tensor that
   never entered ACC. `-kea-fuse` is expected to eliminate all three; if one

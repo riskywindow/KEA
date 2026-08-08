@@ -13,7 +13,11 @@ models/*.onnx
 .DS_Store
 compile_commands.json
 
-# Generated model artifacts -- regenerate with frontend/export_mobilenetv2.py
-# and frontend/export_tiny_vit.py. Too large and too reproducible to track.
-models/*.npz
-models/*.kgraph.json
+# The two calibrated MobileNetV2 graphs (~10 MB total) ARE tracked, so the demo
+# runs out of the box: regenerating them needs a network download of the
+# calibration images, which a reader cloning this repo should not have to do.
+# Everything else generated under models/ is not.
+models/mobilenetv2_int8.kgraph.json
+models/mobilenetv2_int8.npz
+models/tiny_vit_int8.kgraph.json
+models/tiny_vit_int8.npz

@@ -64,10 +64,17 @@ shift, `v << (31 - tosa_shift)`, which has no TOSA counterpart. But it is
 and 39.5% wrong at `|v| < 2^24`, while `tosa_shift = 25` is exact at both.
 
 This matters because real models need it. MobileNetV2's rescale shifts, as
-emitted by our frontend, range over **22 to 48** — a blanket `tosa_shift >= 31`
-rule would reject the network we are built to run. A rescale with
-`tosa_shift < 31` is one whose scale factor exceeds 1, which is entirely normal
-where an operand's scale is much finer than its consumer's.
+emitted by our frontend, range over **21 to 48** across 18,087 per-channel
+shifts — a blanket `tosa_shift >= 31` rule would reject the network we are built
+to run. A rescale with `tosa_shift < 31` is one whose scale factor exceeds 1,
+which is entirely normal where an operand's scale is much finer than its
+consumer's.
+
+Only **20 of those 18,087 shifts** fall below 31, all in a single rescale. That
+is what makes the accumulator-bound formulation worth the trouble: the strict
+rule would have rejected the whole network over 0.1% of its parameters, and the
+weight-derived bound discharges all 20 with room to spare — the end-to-end run
+is bit-exact against the golden reference.
 
 ## Consequences
 

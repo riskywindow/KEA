@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <string>
 
 namespace mlir {
@@ -232,67 +233,149 @@ std::string describeLiveAt(ArrayRef<const Buffer *> bufs, int64_t position,
 // The packer
 //===----------------------------------------------------------------------===//
 
-/// Greedy-by-size, first-fit-by-offset -- TensorFlow Lite Micro's
-/// `GreedyMemoryPlanner`, and what every production NPU compiler ships some
-/// variant of.
+/// The order buffers are offered to the first-fit placer in. Which one wins is
+/// workload dependent, so both are run and the better result is kept (§3.1 of
+/// docs/MEMORY_PLANNING.md).
+enum class PackOrder {
+  /// Largest first -- TensorFlow Lite Micro's `GreedyMemoryPlanner`, and the
+  /// bin-packing intuition: the awkward blocks get a clean arena and the small
+  /// ones fill the gaps they leave. Best when sizes are mixed.
+  BySizeDesc,
+  /// Earliest live range first. On an interval graph, greedy colouring in order
+  /// of left endpoint uses exactly as many colours as the largest clique --
+  /// when `b` is placed, every already-placed buffer that conflicts with it
+  /// also contains the point `b.first`, so they and `b` form a clique, so at
+  /// most `maxclique - 1` slots below can be occupied and one is always free.
+  /// For equal-sized buffers that is an optimality proof, and a double-buffered
+  /// chain of tiles is exactly that case.
+  ByStartAsc,
+};
+
+struct PackResult {
+  bool ok = false;
+  /// High-water mark, `max(offset + size)`.
+  int64_t peak = 0;
+  /// Offsets, parallel to the pool this was computed from.
+  SmallVector<int64_t> offsets;
+  /// The buffer that did not fit, when `!ok`.
+  Buffer *failed = nullptr;
+};
+
+/// Place every buffer in `pool` by first fit at the lowest legal offset,
+/// offering them in `order`. Nothing is written back to the buffers -- the
+/// result is returned so that several orders can be tried and compared.
 ///
 /// Offline dynamic storage allocation (place fixed-size, fixed-lifetime blocks
-/// in the smallest arena) is NP-hard, so this is an approximation. The order
-/// matters: placing the largest buffers first means the awkward blocks get the
-/// clean, unfragmented arena, and the small ones fill the gaps they leave. See
-/// docs/MEMORY_PLANNING.md for what it costs against optimal.
-///
-/// Returns the failing buffer, or nullptr on success. `placed` accumulates
-/// everything successfully placed, which is what the diagnostic needs.
-Buffer *packGreedy(MutableArrayRef<Buffer *> order, int64_t capacity,
-                   int64_t &numShared) {
-  // Largest first; longest-lived first among equals; then by name so the
-  // output is deterministic no matter what order the IR walk produced.
-  llvm::sort(order, [](const Buffer *a, const Buffer *b) {
-    if (a->size != b->size)
-      return a->size > b->size;
-    int64_t la = a->last - a->first, lb = b->last - b->first;
-    if (la != lb)
-      return la > lb;
-    return a->name < b->name;
-  });
+/// in the smallest arena) is NP-hard, so this is an approximation whatever
+/// order it is given. docs/MEMORY_PLANNING.md §3 says what it costs.
+PackResult packOnce(ArrayRef<Buffer *> pool, PackOrder order,
+                    int64_t capacity) {
+  SmallVector<Buffer *> queue(pool.begin(), pool.end());
+  // Both comparators end in the name so the result is deterministic no matter
+  // what order the IR walk produced.
+  if (order == PackOrder::BySizeDesc) {
+    llvm::sort(queue, [](const Buffer *a, const Buffer *b) {
+      if (a->size != b->size)
+        return a->size > b->size;
+      if (a->first != b->first)
+        return a->first < b->first;
+      return a->name < b->name;
+    });
+  } else {
+    llvm::sort(queue, [](const Buffer *a, const Buffer *b) {
+      if (a->first != b->first)
+        return a->first < b->first;
+      if (a->size != b->size)
+        return a->size > b->size;
+      return a->name < b->name;
+    });
+  }
 
-  SmallVector<Buffer *> placed;
-  for (Buffer *b : order) {
+  DenseMap<const Buffer *, int64_t> offset;
+  SmallVector<const Buffer *> placed;
+  PackResult r;
+
+  for (Buffer *b : queue) {
     // Everything already placed whose live range overlaps this one. Those are
     // the only blocks whose storage this buffer must avoid; everything else is
     // free real estate.
-    SmallVector<Buffer *> conflicts;
-    for (Buffer *p : placed)
-      if (p->livesWith(*b))
-        conflicts.push_back(p);
-    llvm::sort(conflicts, [](const Buffer *x, const Buffer *y) {
-      return x->offset < y->offset;
-    });
+    SmallVector<std::pair<int64_t, int64_t>> conflicts; // (offset, end)
+    for (const Buffer *p : placed)
+      if (p->livesWith(*b)) {
+        int64_t o = offset.lookup(p);
+        conflicts.emplace_back(o, o + p->size);
+      }
+    llvm::sort(conflicts);
 
     // Walk the conflicting blocks bottom up, taking the first aligned gap that
     // is big enough.
     int64_t candidate = 0;
-    for (Buffer *p : conflicts) {
-      if (p->offset >= candidate + b->size)
-        break; // the gap below `p` fits.
-      candidate = std::max(candidate, alignUp(p->end(), b->align));
+    for (auto [o, e] : conflicts) {
+      if (o >= candidate + b->size)
+        break; // the gap below this block fits.
+      candidate = std::max(candidate, alignUp(e, b->align));
     }
 
-    if (candidate + b->size > capacity)
-      return b;
+    if (candidate + b->size > capacity) {
+      r.failed = b;
+      return r;
+    }
+    offset[b] = candidate;
+    placed.push_back(b);
+    r.peak = std::max(r.peak, candidate + b->size);
+  }
 
-    b->offset = candidate;
-    // "Shared" means this buffer sits where some non-conflicting buffer also
-    // sits -- the whole point of packing, and the number worth reporting.
-    for (Buffer *p : placed) {
-      if (!p->livesWith(*b) && p->offset < b->end() && b->offset < p->end()) {
+  r.ok = true;
+  for (const Buffer *b : pool)
+    r.offsets.push_back(offset.lookup(b));
+  return r;
+}
+
+/// Place `pool` into `capacity`, trying every order and keeping the placement
+/// with the lowest peak. Writes the winning offsets back into the buffers.
+///
+/// Running both is close to free -- each is O(n^2) on a pool of a few dozen --
+/// and it means neither heuristic's blind spot is the allocator's blind spot.
+/// `BySizeDesc` alone strands a double-buffered tile chain (it colours the
+/// chain out of temporal order and paints itself into a corner);
+/// `ByStartAsc` alone handles that optimally but is worse when sizes are mixed,
+/// because it has no reason to give the big blocks the clean arena.
+///
+/// Returns the failing buffer when no order fits, or nullptr on success.
+Buffer *packSpace(MutableArrayRef<Buffer *> pool, int64_t capacity,
+                  int64_t &numShared) {
+  PackResult best;
+  Buffer *failed = nullptr;
+
+  for (PackOrder order : {PackOrder::BySizeDesc, PackOrder::ByStartAsc}) {
+    PackResult r = packOnce(pool, order, capacity);
+    if (!r.ok) {
+      if (!failed)
+        failed = r.failed;
+      continue;
+    }
+    if (!best.ok || r.peak < best.peak)
+      best = std::move(r);
+  }
+
+  if (!best.ok)
+    return failed;
+
+  for (auto [i, b] : llvm::enumerate(pool))
+    b->offset = best.offsets[i];
+
+  // "Shared" means a buffer sits where some buffer it does NOT interfere with
+  // also sits -- the whole point of packing, and the number worth reporting.
+  for (size_t i = 0; i < pool.size(); ++i)
+    for (size_t j = 0; j < pool.size(); ++j) {
+      if (i == j)
+        continue;
+      const Buffer *a = pool[i], *b = pool[j];
+      if (!a->livesWith(*b) && a->offset < b->end() && b->offset < a->end()) {
         ++numShared;
         break;
       }
     }
-    placed.push_back(b);
-  }
   return nullptr;
 }
 
@@ -433,7 +516,12 @@ int64_t KeaAllocPass::requiredAlignment(const Buffer &b) {
   // The declared alignment is a floor, not the answer: the ops decide.
   int64_t align = std::max<int64_t>(1, b.op().getAlignment());
 
-  auto bump = [&](int64_t a) { align = std::max(align, a); };
+  // Least common multiple, not max. Every alignment the ISA specifies is a
+  // power of two, for which the two agree -- but `kea.alloc`'s `alignment` is
+  // an arbitrary i64, and AllocOp::verify() checks the base against *that*
+  // number, so a declared 3 alongside a derived 16 must yield 48 rather than a
+  // 16 that is not a multiple of 3.
+  auto bump = [&](int64_t a) { align = std::lcm(align, a); };
 
   switch (b.space) {
   case AddressSpace::ACC:
@@ -501,12 +589,20 @@ void KeaAllocPass::reportOutOfCapacity(const Buffer &failed,
            "hold live data at the same instant. Re-run -kea-tile with smaller "
            "tiles";
   } else {
+    // maxlive fits, so a placement exists and -kea-alloc failed to find one.
+    // That is an allocator bug, not a program that is too big, and saying so
+    // sends the reader to the right file. Every order in PackOrder has already
+    // been tried (§3.1 of docs/MEMORY_PLANNING.md) -- including the one that is
+    // provably optimal for equal-sized buffers -- so reaching here means a
+    // genuinely mixed-size fragmentation case that needs a better packer.
     diag.attachNote(failed.op().getLoc())
         << "peak demand is " << peak.bytes << ' ' << unit
         << " at block position " << peak.position << ", which does fit in "
         << capacity << ' ' << unit
-        << ": the shortfall is fragmentation this packer introduced, not a "
-           "property of the program";
+        << ". THIS IS AN ALLOCATOR BUG, not a program that is too big: a valid "
+           "placement exists and -kea-alloc did not find one. Both the "
+           "largest-first and earliest-first orders were tried. Do not retile; "
+           "fix the packer in compiler/lib/Transforms/Alloc.cpp";
   }
   diag.attachNote(failed.op().getLoc())
       << "live at block position " << peak.position << ": "
@@ -525,7 +621,7 @@ LogicalResult KeaAllocPass::placeOnChip(MutableArrayRef<Buffer> buffers,
 
     int64_t capacity = spaceCapacity(space);
     int64_t shared = 0;
-    if (Buffer *failed = packGreedy(pool, capacity, shared)) {
+    if (Buffer *failed = packSpace(pool, capacity, shared)) {
       SmallVector<const Buffer *> constPool(pool.begin(), pool.end());
       reportOutOfCapacity(*failed, constPool, capacity, numPositions);
       return failure();
@@ -585,7 +681,7 @@ LogicalResult KeaAllocPass::placeDram(MutableArrayRef<Buffer> buffers,
     int64_t shared = 0;
     // Pack relative to 0, then rebase onto the region.
     int64_t capacity = static_cast<int64_t>(::kea::KEA_DRAM_BYTES) - cursor;
-    if (Buffer *failed = packGreedy(activations, capacity, shared)) {
+    if (Buffer *failed = packSpace(activations, capacity, shared)) {
       SmallVector<const Buffer *> pool(activations.begin(), activations.end());
       reportOutOfCapacity(*failed, pool, capacity, numPositions);
       return failure();

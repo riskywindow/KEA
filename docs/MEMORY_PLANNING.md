@@ -147,42 +147,90 @@ is told once, at a time this pass cannot bound.
 
 ## 3. The algorithm, and what it costs
 
-**Greedy by size, first fit by offset.** This is TensorFlow Lite Micro's
-`GreedyMemoryPlanner`, and the shape of what production NPU compilers ship.
+**First fit by offset, run in two orders, keeping the better placement.**
 
 ```
-sort buffers by size descending
-       (ties: longer-lived first, then by name, so the result is deterministic)
-
-for each buffer b:
-    conflicts = already-placed buffers whose live range overlaps b's
-    sort conflicts by offset ascending
-    candidate = 0
-    for c in conflicts:
-        if c.offset >= candidate + b.size:   break     # the gap below c fits
-        candidate = max(candidate, alignUp(c.offset + c.size, b.align))
-    if candidate + b.size > capacity:        fail loudly (§6)
-    b.offset = candidate
+for order in (largest-first, earliest-first):
+    for each buffer b in that order:
+        conflicts = already-placed buffers whose live range overlaps b's
+        sort conflicts by offset ascending
+        candidate = 0
+        for c in conflicts:
+            if c.offset >= candidate + b.size:  break   # the gap below c fits
+            candidate = max(candidate, alignUp(c.offset + c.size, b.align))
+        if candidate + b.size > capacity:       this order fails
+        b.offset = candidate
+keep the placement with the lower peak; fail loudly (§6) only if both failed
 ```
 
-### 3.1 Why this algorithm
+| order | sorted by | why |
+|---|---|---|
+| **largest-first** | size desc, then live-range start asc, then name | TensorFlow Lite Micro's `GreedyMemoryPlanner`. Best when sizes are mixed. |
+| **earliest-first** | live-range start asc, then size desc, then name | Provably optimal colouring order for an interval graph (§3.1). |
+
+### 3.1 Why two orders
 
 The problem is **offline dynamic storage allocation**: place blocks of known
 size and known lifetime in the smallest possible arena. It is NP-hard, so any
 practical planner is an approximation and the honest question is *how good an
 approximation*, not *is it optimal*.
 
-Size-descending order is the part that does the work. The largest buffers are
+**Size-descending is the general-purpose heuristic.** The largest buffers are
 the ones that cannot fit anywhere once the arena is chequered, so they go down
-first into a clean arena; the small ones fill the gaps the big ones leave. The
-inverse order — smallest first — reliably strands a large buffer behind a wall
-of small ones. This is the same intuition as first-fit-decreasing for bin
-packing, and it fails in the same rare ways.
+first into a clean arena; the small ones fill the gaps they leave. The inverse
+order reliably strands a large buffer behind a wall of small ones. Same
+intuition as first-fit-decreasing for bin packing, and it fails in the same rare
+ways.
 
-The cost is `O(n²)` in the number of buffers per space, with a tiny constant.
-That is nothing: the MobileNetV2 inverted residual has seven SPM_A buffers, and
-even the full network has a few hundred. The pass does not need, and does not
-have, a smarter data structure.
+**But size order alone is blind to the one structure this backend produces most
+of, and that blindness was a real bug.** A tiled layer after `-kea-schedule` is
+a long chain of *equal-sized* tiles whose live ranges overlap only their
+immediate neighbours — the signature of double buffering:
+
+```
+acc    [ 35,  55]
+acc#1  [ 52,  79]      overlaps acc and acc#2, nothing else
+acc#2  [ 76,  97]
+...                    14 tiles of 14,336 words, never more than 2 live at once
+```
+
+Two slots suffice: alternate 0, 14336, 0, 14336. But when every buffer is the
+same size, the size comparator ties and the tie-break decides everything — and
+the original tie-break was *live-range length*, which has nothing to do with a
+buffer's position in the chain. So the chain was coloured out of temporal order:
+`acc#10` was placed at 0 while `acc#9` was still unconsidered, and by the time
+`acc#9` came up its two neighbours `acc#8` and `acc#10` sat at *different*
+offsets even though they do not interfere with each other. Both slots taken, no
+third slot inside a 32,768-word ACC, and the pass rejected a program that fits.
+
+The fix is to order by **live-range start**. On an interval graph, greedy
+colouring in order of left endpoint uses exactly as many colours as the largest
+clique, and the proof is two lines: when `b` is placed, every already-placed
+buffer that conflicts with it also contains the point `b.first`, so those
+buffers and `b` form a clique; there are therefore at most `ω − 1` of them, so
+at most `ω − 1` slots below `b` can be occupied and one of the first `ω` is
+always free. First fit takes the lowest.
+
+For **equal-sized** buffers that is an optimality guarantee, and it is the
+guarantee that matters here:
+
+> If every buffer in a space is the same size `s`, `align` divides `s`, and
+> `maxlive <= capacity`, the pass **will** find a placement, and its peak will
+> be exactly `maxlive`.
+
+Both orders deliver it — largest-first now breaks ties by live-range start, so
+for uniform sizes it *is* left-endpoint order — but it is `earliest-first` that
+makes it hold unconditionally, without relying on a tie-break, and that is why
+it is kept as a second opinion rather than folded away. (The `align | s`
+condition is real: with `s = 1000` and `align = 16` the slots land at 0, 1008,
+2016, so the peak is `ω * alignUp(s, align)` rather than `ω * s`.)
+
+Running both costs nothing worth measuring — each is `O(n²)` with a tiny
+constant on a pool of a few dozen buffers, and even full MobileNetV2 has a few
+hundred — and it means neither heuristic's blind spot is the allocator's blind
+spot. On every workload in this tree the two tie or largest-first wins; the
+value of `earliest-first` is that the guarantee above does not depend on a
+tie-break surviving a future edit.
 
 ### 3.2 What it leaves on the table
 
@@ -205,7 +253,9 @@ cleverer algorithm could have done better. When it is not, the number is the
 exact size of the prize.
 
 That framing is why the greedy is defensible: it is not "probably fine", it
-comes with a per-compile certificate of how close it landed.
+comes with a per-compile certificate of how close it landed. It is also what
+makes a failure diagnosable — see §6, where the pass uses its own certificate to
+tell the reader whether the program is too big or the packer is at fault.
 
 ### 3.3 Measured — the MobileNetV2 inverted residual
 
@@ -241,6 +291,29 @@ Three things to read off these:
   §5.4 has the per-layer footprints for full MobileNetV2, where SPM_A tiles run
   to ~100 KB of the 131 KB budget and packing across layers is what keeps the
   whole program inside 256 KiB.
+
+### 3.4 Measured — a tiled layer, after scheduling
+
+The block above is small enough to compile without tiling. The case that
+exercises the packer properly is a single 112×112×32 → 16 pointwise, which does
+not fit on chip and so becomes fourteen row bands that `-kea-schedule` double
+buffers (`compiler/test/kea-alloc-tiled.mlir`):
+
+| space | buffers | unpacked | **peak** | maxlive | fragmentation | capacity | used |
+|---|---|---|---|---|---|---|---|
+| SPM_A | 28 | 602,560 B | **215,200 B** | 215,184 B | 16 B | 262,144 B | 82.1% |
+| SPM_W | 2 | 704 B | **704 B** | 704 B | 0 | 262,144 B | 0.3% |
+| ACC | 14 | 200,704 w | **28,672 w** | 28,672 w | **0** | 32,768 w | 87.5% |
+
+This is the shape the pass is really for. ACC demand of 200,704 words — more
+than six times the whole accumulator — packs into 28,672, exactly `maxlive`,
+by alternating two tiles between offsets 0 and 14,336. SPM_A packs 602,560 bytes
+into 215,200, losing 16 bytes to a single alignment round-up. Without packing
+neither space would fit and the layer would not compile at all.
+
+It is also the case that caught the ordering bug in §3.1: at 87.5% of ACC there
+are exactly two slots, so getting the colouring order wrong is not a few percent
+of waste, it is a hard failure.
 
 The zero-fragmentation result is not a coincidence of a small example. Greedy by
 size hits `maxlive` exactly whenever the live ranges are "well nested" — which
@@ -289,8 +362,11 @@ answer:
 | a DRAM object | 16 bytes | `KEA_ALIGN_DMA_RECOMMENDED` |
 | the DRAM arena itself | 64 bytes | `KEA_DRAM_BASE_ALIGN` |
 
-A buffer used as both a weight tile and a qparam block gets the stronger of the
-two. `compiler/test/kea-alloc.mlir`'s `@alignment_is_derived` is the proof: two
+A buffer used as both a weight tile and a qparam block gets the **least common
+multiple** of the two, not the larger. For the powers of two the ISA actually
+specifies the two agree, but `kea.alloc`'s `alignment` is an arbitrary `i64` and
+`AllocOp::verify()` checks the base against *that* number — so a declared 3
+alongside a derived 16 has to yield 48, not a 16 that is not a multiple of 3. `compiler/test/kea-alloc.mlir`'s `@alignment_is_derived` is the proof: two
 SPM_W buffers both declare `alignment = 4`, and the one fed to `LOAD_W` is
 placed at 608 rather than 600 because the pass strengthened it to 16.
 
@@ -368,9 +444,17 @@ Four things, all of them actionable:
    * `maxlive > capacity` — the live data genuinely does not fit. **No allocator
      could place this**, so the fix is upstream: retile. Saying so stops the
      reader from hunting for a better packer.
-   * `maxlive <= capacity` — the same data would fit under a better placement,
-     so the shortfall is fragmentation this packer introduced. That is a bug
-     report against `-kea-alloc`, not against the tiling, and it says so.
+   * `maxlive <= capacity` — a valid placement **exists** and this pass did not
+     find it. That is a bug report against `-kea-alloc`, not against the
+     tiling, and the diagnostic says so in as many words ("THIS IS AN ALLOCATOR
+     BUG... Do not retile; fix the packer in
+     compiler/lib/Transforms/Alloc.cpp"). Sending someone to re-tile a program
+     that already fits wastes their afternoon; this is the one branch where
+     the pass is allowed to blame itself, and it takes it.
+
+   The pass acts on its own certificate here rather than reporting a generic
+   failure — the `maxlive` it publishes on every successful compile is the same
+   number that decides which of these two messages you get.
 4. **The buffers alive at the peak**, largest first, capped at eight with a tail
    count. This is the list you need to know which layer to re-tile.
 

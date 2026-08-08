@@ -62,14 +62,22 @@
 // is what `-kea-tile`'s `spm-reserve-factor = 2` reserved the room for.
 // SEPARATED-LABEL: func.func @two_tiles
 // SEPARATED-SAME:  spm_a = {buffers = 4 : i64, capacity = 262144 : i64, fragmentation = 0 : i64, maxlive = 3120 : i64, peak = 3120 : i64, unpacked = 4160 : i64}
-// SEPARATED: kea.alloc {addr = 2080 : i64, {{.*}}name = "t.a0"
+//
+// The exact offsets below are one valid answer, not a contract: any packing
+// that separates the concurrent pairs and reaches peak 3120 is equally correct,
+// and -kea-alloc's tie-break between equal-sized buffers has changed once
+// already (it now orders them by live-range start, which is what makes a
+// double-buffered chain colourable -- see docs/MEMORY_PLANNING.md §3.1). What
+// this test is really asserting is on the two lines above and in the four
+// pairings below: t.a0/t.a1, t.o0/t.o1 and t.c0/t.c1 must not share storage.
+// SEPARATED: kea.alloc {addr = 0 : i64, {{.*}}name = "t.a0"
 // SEPARATED: kea.alloc {addr = 1040 : i64, {{.*}}name = "t.a1"
 // The two ACC regions and the two output tiles are separated for the same
 // reason, so nothing in the pipeline is aliased against something concurrent.
-// SEPARATED: kea.alloc {addr = 0 : i64, {{.*}}name = "t.o0"
+// SEPARATED: kea.alloc {addr = 2080 : i64, {{.*}}name = "t.o0"
 // SEPARATED: kea.alloc {addr = 0 : i64, {{.*}}name = "t.c0"
 // SEPARATED: kea.alloc {addr = 1024 : i64, {{.*}}name = "t.c1"
-// SEPARATED: kea.alloc {addr = 1040 : i64, {{.*}}name = "t.o1"
+// SEPARATED: kea.alloc {addr = 0 : i64, {{.*}}name = "t.o1"
 
 
 func.func @two_tiles() {

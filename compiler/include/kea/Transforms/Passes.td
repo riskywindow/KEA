@@ -268,13 +268,13 @@ def KeaAlloc : Pass<"kea-alloc", "::mlir::func::FuncOp"> {
     device one contiguous arena of a size this pass computed.
 
     In:  Level 2 with symbolic `kea.alloc` buffers (docs/DIALECT_L2.md §4).
-    Out: the same program with a `kea.addr` base stamped on every `kea.alloc`,
+    Out: the same program with an `addr` base stamped on every `kea.alloc`,
          plus `kea.dram_layout`, `kea.spm_map` and `kea.occupancy` on the
          function.
 
     Per docs/DIALECT_L2.md §1.1(a) an address in the instruction stream is a
     `(buffer, displacement)` pair and `-kea-emit` writes
-    `instr.X_addr = base(X) + X_addr`. `base(X)` is exactly the `kea.addr` this
+    `instr.X_addr = base(X) + X_addr`. `base(X)` is exactly the `addr` this
     pass assigns. The displacements are deliberately left alone: they are what
     the Level 2 in-bounds verifiers check a strided walk against, so folding an
     absolute address into them would make every walk look out of bounds.
@@ -283,11 +283,14 @@ def KeaAlloc : Pass<"kea-alloc", "::mlir::func::FuncOp"> {
 
     * **Scratchpad placement by live-range packing.** Two on-chip buffers may
       share storage iff their `live = [first, last]` intervals are disjoint.
-      The packer is greedy-by-size with first-fit-by-offset, the algorithm
-      TensorFlow Lite Micro's `GreedyMemoryPlanner` uses; offline dynamic
-      storage allocation is NP-hard, so this is an approximation and the pass
-      reports how far it landed from the `maxlive` lower bound rather than
-      pretending it is optimal.
+      The packer is first-fit-by-offset, run in two orders and keeping
+      whichever placement has the lower peak: largest-first (TensorFlow Lite
+      Micro's `GreedyMemoryPlanner`, best when sizes are mixed) and
+      earliest-live-range-first (which provably colours an interval graph
+      optimally, and a double-buffered chain of tiles is exactly that).
+      Offline dynamic storage allocation is NP-hard, so this is still an
+      approximation, and the pass reports how far it landed from the `maxlive`
+      lower bound rather than pretending it is optimal.
     * **Units.** SPM_A/SPM_W are byte addressed, ACC is addressed in int32
       *words*. Sizes and offsets are always in the space's own unit, which is
       also the element type of the buffer (`i8` vs `i32`), so the two can never
@@ -320,7 +323,7 @@ def KeaAlloc : Pass<"kea-alloc", "::mlir::func::FuncOp"> {
     // is how a hand-corrupted allocation is tested, and it makes the pass
     // usable as a checker for IR some other tool wrote.
     Option<"verifyOnly", "verify-only", "bool", /*default=*/"false",
-           "Do not allocate; verify the kea.addr placement already in the IR">,
+           "Do not allocate; verify the addr placement already in the IR">,
     // Statistics are inert on this LLVM install (Release+NDEBUG => NoopStatistic,
     // see compiler/README.md gotcha 21a), so the numbers that matter are
     // published as attributes. The SPM map is not debug output -- ARTIFACT_FORMAT.md

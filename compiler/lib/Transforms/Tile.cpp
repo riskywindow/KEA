@@ -471,8 +471,8 @@ private:
   OpBuilder b;
   int64_t spmReserve;
   int64_t layerId = 0;
-  /// Occurrence count per requested scratch name, for uniquification.
-  llvm::StringMap<unsigned> scratchNameCount;
+  /// Occurrence count per requested buffer name, for uniquification.
+  llvm::StringMap<unsigned> bufferNameCount;
   DenseMap<Value, Value> dramFor; // Level 1 tensor -> DRAM !kea.buffer
 
   /// Count of LOAD_W/MATMUL pairs emitted so far, monotonic over the whole
@@ -504,8 +504,29 @@ private:
   }
 
   //--- buffer construction ------------------------------------------------
+  /// Create a buffer, uniquifying its name across *every* buffer in the
+  /// function.
+  ///
+  /// Two distinct things collide here. `layerName()` is per-layer while scratch
+  /// buffers are created per *tile*, so a layer with four spatial tiles asks
+  /// for "f.3.atile" four times. And a scratch tile can collide with a DRAM
+  /// buffer of the same layer -- `lowerPool` asked for `layerName("out")` for
+  /// both. DIALECT_L2.md §4.1 requires names unique in the module and
+  /// `kea-translate` rejects duplicates outright, so either collision stops a
+  /// layer reaching `.kasm`.
+  ///
+  /// Uniquifying in one place, over one registry, is what makes that
+  /// structurally impossible rather than a rule each caller has to remember.
+  /// The suffix only appears from the second occurrence, so names that were
+  /// already unique -- and the tests pinning them -- are unchanged. DRAM
+  /// buffers are created once per tensor (`dram()` caches in `dramFor`), so
+  /// including them here cannot rename a symbol that is referenced elsewhere.
   Value makeBuffer(Location loc, int64_t extent, AddressSpace as,
-                   StringRef name, StringRef role, ValueRange source = {}) {
+                   StringRef nameIn, StringRef role, ValueRange source = {}) {
+    unsigned n = bufferNameCount[nameIn]++;
+    std::string uniqueName =
+        n == 0 ? nameIn.str() : (nameIn + Twine('#') + Twine(n)).str();
+    StringRef name(uniqueName);
     Type elem = (as == AddressSpace::ACC) ? b.getIntegerType(32)
                                           : b.getIntegerType(8);
     auto ty = BufferType::get(b.getContext(), {extent}, elem, as);
@@ -515,20 +536,8 @@ private:
     return op.getResult();
   }
 
-  /// A scratchpad buffer. The name is uniquified, because `layerName()` is
-  /// per-layer while these are created per *tile*: a layer with four spatial
-  /// tiles asks for "f.3.atile" four times and would otherwise emit four
-  /// buffers sharing one name. DIALECT_L2.md §4.1 requires names to be unique
-  /// in the module, and `kea-translate` rejects a duplicate outright, so
-  /// without this no genuinely tiled layer can reach `.kasm`.
-  ///
-  /// The suffix is only appended from the second occurrence, so an untiled
-  /// layer's names -- and every test pinning them -- are unchanged.
   Value scratch(Location loc, int64_t extent, AddressSpace as, StringRef name) {
-    unsigned n = scratchNameCount[name]++;
-    std::string unique =
-        n == 0 ? name.str() : (name + Twine('#') + Twine(n)).str();
-    return makeBuffer(loc, extent, as, unique, "scratch");
+    return makeBuffer(loc, extent, as, name, "scratch");
   }
 
   /// The DRAM buffer backing a Level 1 tensor value, created on demand.
@@ -1260,9 +1269,10 @@ LogicalResult Tiler::lowerPool(PoolOp op) {
 
   for (int64_t oh0 = 0; oh0 < OH; oh0 += *ohT) {
     ++numTiles;
-    Value aTile = scratch(loc, ihP * IW * C, AddressSpace::A, layerName("in"));
+    Value aTile =
+        scratch(loc, ihP * IW * C, AddressSpace::A, layerName("atile"));
     Value oTile =
-        scratch(loc, *ohT * OW * C, AddressSpace::A, layerName("out"));
+        scratch(loc, *ohT * OW * C, AddressSpace::A, layerName("otile"));
     b.create<DmaLoadOp>(loc, inBuf, aTile,
                         /*dram_addr=*/oh0 * strides[0] * IW * C,
                         /*spm_addr=*/0, /*len0=*/IW * C, /*n1=*/ihP, /*n2=*/1,
